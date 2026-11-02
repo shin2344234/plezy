@@ -14,6 +14,7 @@ import 'package:sentry_flutter/sentry_flutter.dart';
 
 import '../mpv/mpv.dart';
 import '../mpv/player/platform/player_android.dart';
+import '../mpv/player/platform/player_linux.dart';
 import '../mpv/player/player_native.dart';
 
 import '../services/scrub_preview_source.dart';
@@ -797,6 +798,7 @@ class VideoPlayerScreenState extends State<VideoPlayerScreen>
   /// Media-controls listeners created once per attempt by [_initializeServices].
   final List<StreamSubscription<dynamic>> _mediaControlSubscriptions = [];
   StreamSubscription<AppleTvRemotePlayPauseAction>? _appleTvPlayPauseSubscription;
+  StreamSubscription<void>? _linuxWindowExitSubscription;
   TrackManager? _trackManager;
   StreamSubscription<void>? _sleepTimerSubscription;
   bool _isHandlingBack = false;
@@ -1500,6 +1502,13 @@ class VideoPlayerScreenState extends State<VideoPlayerScreen>
 
     _companionRemote.bind();
     _setupAppleTvRemotePlaybackActions();
+    if (Platform.isLinux) {
+      // Back in mpv's own window (X11 sessions) leaves the player the same
+      // way the in-app back button does.
+      _linuxWindowExitSubscription = PlayerLinux.windowExitRequests.listen((_) {
+        if (mounted) unawaited(_handleBackButton());
+      });
+    }
 
     _sleepTimerSubscription = SleepTimerService().onPrompt.listen((_) {
       if (mounted) _showStillWatchingDialog();
@@ -2478,6 +2487,7 @@ class VideoPlayerScreenState extends State<VideoPlayerScreen>
     // closes its streams, so no startup waiter outlives it.
     _cancelPlayerStreamSubscriptions(includeMediaControls: true);
     _appleTvPlayPauseSubscription?.cancel();
+    _linuxWindowExitSubscription?.cancel();
     _sleepTimerSubscription?.cancel();
     // Before the track manager is disposed, not after: its own dispose
     // invalidates the pending selection too, and running the abort second
@@ -2948,6 +2958,8 @@ class VideoPlayerScreenState extends State<VideoPlayerScreen>
     final cancellations = _cancelPlayerStreamSubscriptions(includeMediaControls: true);
     final remoteCancellation = _appleTvPlayPauseSubscription?.cancel();
     if (remoteCancellation != null) cancellations.add(remoteCancellation);
+    final windowExitCancellation = _linuxWindowExitSubscription?.cancel();
+    if (windowExitCancellation != null) cancellations.add(windowExitCancellation);
     final sleepCancellation = _sleepTimerSubscription?.cancel();
     if (sleepCancellation != null) cancellations.add(sleepCancellation);
 

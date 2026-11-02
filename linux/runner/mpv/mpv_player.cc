@@ -318,8 +318,55 @@ MpvPlayer::~MpvPlayer() { Dispose(); }
 
 bool MpvPlayer::IsInitialized() const {
   std::lock_guard<std::mutex> lock(native_mutex_);
-  return mpv_ != nullptr && (audio_only_ || mpv_gl_ != nullptr);
+  return mpv_ != nullptr && (audio_only_ || window_output_ || mpv_gl_ != nullptr);
 }
+
+void MpvPlayer::SetWindowOutput(bool enabled) {
+  std::lock_guard<std::mutex> lock(native_mutex_);
+  if (mpv_ != nullptr || audio_only_) {
+    g_warning("MPV: window output can only be chosen for a video player before initialization");
+    return;
+  }
+  window_output_ = enabled;
+}
+
+namespace {
+
+// The client message a back press in mpv's window sends. Dart owns leaving
+// the player, so the window asks rather than quitting the core itself.
+constexpr char kWindowExitMessage[] = "plezy-window-exit";
+
+// Bindings for mpv's window. libmpv starts with input-default-bindings=no, and
+// the defaults would quit the core on q, Esc and the gamepad's Back, which
+// leaves Plezy holding a dead player. Every key that would quit asks Plezy to
+// exit instead, and the pad gets a small playback set: A or Start pauses, the
+// d-pad seeks and cycles tracks, the shoulders seek a minute, X shows the
+// stats overlay that says whether the output is HDR.
+constexpr const char* kWindowBindings[][2] = {
+    {"GAMEPAD_ACTION_RIGHT", "script-message plezy-window-exit"},
+    {"GAMEPAD_BACK", "script-message plezy-window-exit"},
+    {"GAMEPAD_MENU", "script-message plezy-window-exit"},
+    {"ESC", "script-message plezy-window-exit"},
+    {"BS", "script-message plezy-window-exit"},
+    {"q", "script-message plezy-window-exit"},
+    {"Q", "script-message plezy-window-exit"},
+    {"MBTN_BACK", "script-message plezy-window-exit"},
+    {"CLOSE_WIN", "script-message plezy-window-exit"},
+    {"STOP", "script-message plezy-window-exit"},
+    {"POWER", "script-message plezy-window-exit"},
+    {"GAMEPAD_ACTION_DOWN", "cycle pause"},
+    {"GAMEPAD_START", "cycle pause"},
+    {"GAMEPAD_DPAD_LEFT", "seek -10"},
+    {"GAMEPAD_DPAD_RIGHT", "seek 10"},
+    {"GAMEPAD_LEFT_SHOULDER", "seek -60"},
+    {"GAMEPAD_RIGHT_SHOULDER", "seek 60"},
+    {"GAMEPAD_DPAD_UP", "cycle sub"},
+    {"GAMEPAD_DPAD_DOWN", "cycle audio"},
+    {"GAMEPAD_ACTION_UP", "show-progress"},
+    {"GAMEPAD_ACTION_LEFT", "script-binding stats/display-stats-toggle"},
+};
+
+}  // namespace
 
 bool MpvPlayer::HasMpvHandle() const {
   std::lock_guard<std::mutex> lock(native_mutex_);
@@ -351,7 +398,25 @@ bool MpvPlayer::Initialize() {
   plezy::mpv_common::ApplyCommonStartupOptions(mpv_, audio_only_);
   mpv_set_option_string(mpv_, "terminal", "no");
 
-  if (!audio_only_) {
+  if (window_output_) {
+    // mpv's own fullscreen window. gamescope reads the swapchain's colour space
+    // from its WSI layer, so the hint is what turns PQ output on; a later
+    // `hdr-enabled` write moves it through SetHDREnabled.
+    mpv_set_option_string(mpv_, "vo", "gpu-next");
+    mpv_set_option_string(mpv_, "gpu-api", "vulkan");
+    mpv_set_option_string(mpv_, "gpu-context", "x11vk");
+    mpv_set_option_string(mpv_, "hwdec", "auto");
+    mpv_set_option_string(mpv_, "fullscreen", "yes");
+    mpv_set_option_string(mpv_, "force-window", "yes");
+    mpv_set_option_string(mpv_, "title", "Plezy");
+    mpv_set_option_string(mpv_, "hdr-compute-peak", "auto");
+    mpv_set_option_string(mpv_, "target-colorspace-hint", plezy::mpv_common::TargetColorspaceHint(hdr_enabled_));
+    mpv_set_option_string(mpv_, "osc", "yes");
+    mpv_set_option_string(mpv_, "input-default-bindings", "yes");
+    mpv_set_option_string(mpv_, "input-vo-keyboard", "yes");
+    mpv_set_option_string(mpv_, "input-gamepad", "yes");
+    mpv_set_option_string(mpv_, "cursor-autohide", "1000");
+  } else if (!audio_only_) {
     // Configure mpv for embedded playback.
     mpv_set_option_string(mpv_, "vo", "libmpv");
     mpv_set_option_string(mpv_, "hwdec", "auto");
@@ -389,6 +454,16 @@ bool MpvPlayer::Initialize() {
     return false;
   }
 
+  if (window_output_) {
+    for (const auto& binding : kWindowBindings) {
+      const char* keybind[] = {"keybind", binding[0], binding[1], nullptr};
+      const int bind_result = mpv_command(mpv_, keybind);
+      if (bind_result < 0) {
+        g_warning("MPV: could not bind %s in the video window: %s", binding[0], mpv_error_string(bind_result));
+      }
+    }
+  }
+
   // Set up event wakeup callback.
   mpv_set_wakeup_callback(mpv_, OnMpvWakeup, callback_context_.get());
   mpv_observe_property(mpv_, 0, "current-ao", MPV_FORMAT_STRING);
@@ -408,7 +483,9 @@ bool MpvPlayer::Initialize() {
     mpv_observe_property(mpv_, kHwdecCurrentUserdata, "hwdec-current", MPV_FORMAT_STRING);
   }
 
-  g_message("MPV: Initialization successful (%s)", audio_only_ ? "audio-only" : "render context deferred");
+  g_message(
+      "MPV: Initialization successful (%s)",
+      audio_only_ ? "audio-only" : (window_output_ ? "own window" : "render context deferred"));
   return true;
 }
 
@@ -1231,6 +1308,14 @@ void MpvPlayer::HandleMpvEvent(mpv_event* event) {
       active_source_id_ = start->playlist_entry_id;
       has_active_source_id_ = true;
       SendActiveSourceEvent("start-file");
+      break;
+    }
+    case MPV_EVENT_CLIENT_MESSAGE: {
+      const auto* message = static_cast<mpv_event_client_message*>(event->data);
+      if (window_output_ && message != nullptr && message->num_args >= 1 &&
+          g_strcmp0(message->args[0], kWindowExitMessage) == 0) {
+        SendEvent("window-exit", nullptr);
+      }
       break;
     }
     case MPV_EVENT_FILE_LOADED: {

@@ -1,5 +1,7 @@
 #include "mpv_plugin.h"
 
+#include <gdk/gdkx.h>
+
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -976,6 +978,24 @@ static void apply_display_fps(MpvPlugin* self, GdkMonitor* monitor) {
 // Brings up the native Wayland video plane, the only way this runner renders
 // video. Returns false with |error| set to the specific reason: there is no
 // second path to fall through to, so the reason is what the user is told.
+// An X11 session has no Wayland plane to offer, so video gets mpv's own
+// window there instead (MpvPlayer::SetWindowOutput). gamescope runs apps under
+// Xwayland, and HDR reaches only X11 surfaces in it, so this is also the path
+// that gives Game Mode HDR10. A Wayland session keeps the plane.
+static bool uses_window_output(MpvPlugin* self) {
+  FlView* view = fl_plugin_registrar_get_view(self->registrar);
+  if (view == nullptr) return false;
+  GdkDisplay* display = gtk_widget_get_display(GTK_WIDGET(view));
+  return display != nullptr && GDK_IS_X11_DISPLAY(display);
+}
+
+// True while a video session plays in mpv's own window. The plane-only
+// methods (geometry, visibility, the HDR transaction) have nothing to act on
+// then and answer without touching mpv.
+static bool window_output_active(MpvPlugin* self) {
+  return self->initialized && self->player && self->player->window_output();
+}
+
 static gboolean start_video_plane(MpvPlugin* self, FlView* view, std::string* error) {
   if (view == nullptr) {
     *error = "The window has no Flutter view to place a video plane under";
@@ -1161,18 +1181,26 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
         response =
             FL_METHOD_RESPONSE(fl_method_error_response_new("INIT_FAILED", "Failed to initialize MPV player", nullptr));
       }
-    } else if (self->video_surface && self->video_surface->valid()) {
+    } else if ((self->video_surface && self->video_surface->valid()) || window_output_active(self)) {
       response = bool_success_response(TRUE);
     } else {
       if (!self->player || self->player->IsDisposed()) {
         self->player = std::make_unique<mpv::MpvPlayer>();
       }
+      const bool window_output = uses_window_output(self);
+      if (window_output) self->player->SetWindowOutput(true);
 
       std::string error;
       if (!self->player->Initialize()) {
         release_video_resources(self);
         response =
             FL_METHOD_RESPONSE(fl_method_error_response_new("INIT_FAILED", "Failed to initialize MPV player", nullptr));
+      } else if (window_output) {
+        ++self->generation;
+        self->player->SetEventCallback([self](FlValue* event) { send_event(self, event); });
+        self->initialized = TRUE;
+        g_message("MPV: X11 session, video plays in mpv's own window");
+        response = bool_success_response(TRUE);
       } else if (start_video_plane(self, fl_plugin_registrar_get_view(self->registrar), &error)) {
         ++self->generation;
         self->player->SetEventCallback([self](FlValue* event) { send_event(self, event); });
@@ -1241,6 +1269,37 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
         response = FL_METHOD_RESPONSE(fl_method_error_response_new("INVALID_ARGS", "Missing 'name'", nullptr));
       } else if (value_value == nullptr || fl_value_get_type(value_value) != FL_VALUE_TYPE_STRING) {
         response = FL_METHOD_RESPONSE(fl_method_error_response_new("INVALID_ARGS", "Missing 'value'", nullptr));
+      } else if (window_output_active(self) && g_strcmp0(fl_value_get_string(name_value), "hdr-tone-mapping") == 0) {
+        // mpv's window hands gamescope a PQ swapchain and gamescope maps it to
+        // the display, so there is no player-side choice to make here.
+        response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+      } else if (window_output_active(self) && g_strcmp0(fl_value_get_string(name_value), "hdr-enabled") == 0) {
+        // The window's HDR is just mpv's colour-space hint: with it, gpu-next
+        // picks an HDR10 swapchain format whenever gamescope offers one.
+        const bool enabled = plezy::mpv_common::ParseEnabledFlag(fl_value_get_string(value_value));
+        g_object_ref(method_call);
+        self->player->SetWindowHdrEnabled(enabled, [method_call, enabled](int error) {
+          g_autoptr(FlMethodResponse) async_response = nullptr;
+          if (plezy::mpv_common::SetPropertyStatusSucceeded(error)) {
+            async_response = FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+          } else {
+            async_response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+                plezy::mpv_common::kSetPropertyFailedCode,
+                (std::string("hdr-enabled='") + (enabled ? "yes" : "no") + "' failed: " + mpv_error_string(error))
+                    .c_str(),
+                nullptr));
+          }
+          fl_method_call_respond(method_call, async_response, nullptr);
+          g_object_unref(method_call);
+        });
+        return;
+      } else if (window_output_active(self) && g_strcmp0(fl_value_get_string(name_value), "vo") == 0) {
+        // Same invariant as the plane's guard below, for the window: the
+        // window exists because vo=gpu-next owns it, and any other vo closes
+        // it under the user.
+        response = FL_METHOD_RESPONSE(fl_method_error_response_new(
+            plezy::mpv_common::kSetPropertyFailedCode,
+            "vo is owned by Plezy: video plays in mpv's own gpu-next window on X11", nullptr));
       } else if (self->video_surface && g_strcmp0(fl_value_get_string(name_value), "hdr-tone-mapping") == 0) {
         // Not an mpv property: it selects which side reduces the source's range,
         // which changes both mpv's target-peak and the luminances the compositor
@@ -1501,7 +1560,10 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
     // The output half of the gate is what stops the app offering an HDR toggle
     // on an SDR panel, where enabling it only invites the compositor to tone-map
     // a plane that never needed to be PQ in the first place.
-    response = bool_success_response(hdr_available(self));
+    // On X11 the answer is gamescope's. Its WSI layer offers the HDR10 colour
+    // space only while the output is in HDR, so on an SDR output mpv picks an
+    // SDR swapchain by itself and the toggle changes nothing.
+    response = bool_success_response(hdr_available(self) || (!self->audio_only && uses_window_output(self)));
   } else if (strcmp(method, "setVideoRect") == 0) {
     {
       auto read_int = [args](const char* key, int64_t* out) {

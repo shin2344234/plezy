@@ -86,6 +86,15 @@ class MpvPlayer {
   /// @return true if initialization succeeded.
   bool Initialize();
 
+  /// Selects mpv's own output window instead of the render API. Must be called
+  /// before Initialize(). The window is vo=gpu-next on Vulkan over X11, which
+  /// is the one path gamescope gives an HDR10 swapchain; mpv draws its own OSC
+  /// and reads the gamepad through SDL, since the window holds input focus.
+  /// No render context is created, so InitRenderContextForSurface must not be
+  /// called. A back press in the window arrives as a "window-exit" event.
+  void SetWindowOutput(bool enabled);
+  bool window_output() const { return window_output_; }
+
   /// Creates the mpv render context bound to the app-owned EGL window surface
   /// backing the Wayland video plane. This is the only render path: nothing
   /// here is shared with or derived from Flutter's GL state, so the context is
@@ -129,6 +138,11 @@ class MpvPlayer {
   using StatusCallback = plezy::mpv_common::StatusCallback;
   using CommandCallback = plezy::mpv_common::CommandCallback;
   using GetPropertyCallback = plezy::mpv_common::GetPropertyCallback;
+
+  /// HDR for the window output (SetWindowOutput): only mpv's colour-space
+  /// hint, since gamescope describes the swapchain itself. The plane goes
+  /// through SetHdrOutput instead.
+  void SetWindowHdrEnabled(bool enabled, StatusCallback callback) { SetHDREnabled(enabled, std::move(callback)); }
 
   /// Executes an mpv command asynchronously to prevent UI blocking.
   void CommandAsync(const std::vector<std::string>& args, CommandCallback callback);
@@ -439,6 +453,8 @@ class MpvPlayer {
   ::_FlValue* NodeToFlValue(mpv_node* node, plezy::mpv_common::NodeConversionBudget* budget);
 
   const bool audio_only_;
+  // See SetWindowOutput. Fixed once Initialize has run.
+  bool window_output_ = false;
   mpv_handle* mpv_ = nullptr;
   mpv_render_context* mpv_gl_ = nullptr;
 
