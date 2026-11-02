@@ -1,0 +1,37 @@
+--- a/libavcodec/bsf/dovi_split.c	2026-11-02 14:06:13.449729900 -0600
++++ b/libavcodec/bsf/dovi_split.c	2026-11-02 14:06:24.805503600 -0600
+@@ -79,19 +79,8 @@
+     }
+ 
+     if (keep_el) {
+-        const AVPacketSideData *sd;
+-        sd = av_packet_side_data_get(ctx->par_out->coded_side_data,
+-                                     ctx->par_out->nb_coded_side_data,
+-                                     AV_PKT_DATA_HEVC_CONF);
+-        if (sd && sd->size >= 23) {
+-            uint8_t *new_ed = av_mallocz(sd->size + AV_INPUT_BUFFER_PADDING_SIZE);
+-            if (!new_ed)
+-                return AVERROR(ENOMEM);
+-            memcpy(new_ed, sd->data, sd->size);
+-            av_freep(&ctx->par_out->extradata);
+-            ctx->par_out->extradata = new_ed;
+-            ctx->par_out->extradata_size = sd->size;
+-        }
++        /* n8.0.1 has no HEVC configuration side data, so the EL keeps the BL's
++         * hvcC and takes its parameter sets from its own NAL units. */
+ 
+         /* DV profile to EL size ratio */
+         static const uint8_t el_div[] = {
+@@ -114,12 +103,6 @@
+         }
+     }
+ 
+-    /* Drop AV_PKT_DATA_HEVC_CONF as it's no longer valid on output. It's
+-     * set as extradata for EL. */
+-    av_packet_side_data_remove(ctx->par_out->coded_side_data,
+-                               &ctx->par_out->nb_coded_side_data,
+-                               AV_PKT_DATA_HEVC_CONF);
+-
+     s->nal_length_size = hvcc_nal_length_size(ctx->par_in->extradata,
+                                               ctx->par_in->extradata_size);
+     s->out_nal_length_size = hvcc_nal_length_size(ctx->par_out->extradata,

@@ -1,0 +1,840 @@
+diff --git a/video/mp_image.c b/video/mp_image.c
+index d1a85e7..54e01f6 100644
+--- a/video/mp_image.c
++++ b/video/mp_image.c
+@@ -40,6 +40,7 @@
+ #include "osdep/threads.h"
+ #include "sws_utils.h"
+ #include "out/placebo/utils.h"
++#include "out/dvbridge.h"
+ 
+ // Determine strides, plane sizes, and total required size for an image
+ // allocation. Returns total size on success, <0 on error. Unused planes
+@@ -1185,6 +1186,17 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+ #ifdef PL_HAVE_LAV_DOLBY_VISION
+         const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
+         const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
++        // libplacebo maps only frames without a residual. A profile 7 MEL
++        // frame needs only the base layer and the RPU, so it is mapped from
++        // a copy that has the flag set, the same as profile 8.1.
++        AVDOVIMetadata *mel = NULL;
++        if (!header->disable_residual_flag && dvbridge_dovi_is_mel(metadata)) {
++            mel = av_memdup(metadata, sd->buf->size);
++            MP_HANDLE_OOM(mel);
++            av_dovi_get_header(mel)->disable_residual_flag = 1;
++            metadata = mel;
++            header = av_dovi_get_header(metadata);
++        }
+         if (header->disable_residual_flag) {
+             dst->dovi = dovi = av_buffer_alloc(sizeof(struct pl_dovi_metadata));
+             MP_HANDLE_OOM(dovi);
+@@ -1200,6 +1212,7 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
+             dst->params.color = frame.color;
+ #endif
+         }
++        av_free(mel);
+ #endif
+     }
+ 
+diff --git a/video/out/drm_common.c b/video/out/drm_common.c
+index ffc5ebf..1f3cef4 100644
+--- a/video/out/drm_common.c
++++ b/video/out/drm_common.c
+@@ -104,6 +104,7 @@ const struct m_sub_options drm_conf = {
+         {"drm-draw-surface-size", OPT_SIZE_BOX(draw_surface_size)},
+         {"drm-vrr-enabled", OPT_CHOICE(vrr_enabled,
+             {"no", 0}, {"yes", 1}, {"auto", -1})},
++        {"drm-dvbridge", OPT_BOOL(dvbridge)},
+         {0},
+     },
+     .defaults = &(const struct drm_opts) {
+@@ -328,6 +329,112 @@ static void vt_switcher_poll(struct vt_switcher *s, int timeout_ns)
+     }
+ }
+ 
++// Dolby Vision tunnel on amdgpu with the LibreELEC Hades DVBRIDGE patches.
++// The kernel refuses the tunnel unless the primary plane is alone on the CRTC
++// and every colour stage is in bypass, so all of them go back to default.
++static int dvbridge_enum_value(struct drm_object *object, const char *name,
++                               const char *value_name, uint64_t *value)
++{
++    for (int i = 0; i < object->props->count_props; i++) {
++        drmModePropertyRes *info = object->props_info[i];
++        if (strcmp(info->name, name))
++            continue;
++        for (int j = 0; j < info->count_enums; j++) {
++            if (strcmp(info->enums[j].name, value_name))
++                continue;
++            *value = drm_property_type_is(info, DRM_MODE_PROP_BITMASK) ?
++                     1ULL << info->enums[j].value : info->enums[j].value;
++            return 0;
++        }
++    }
++    return -EINVAL;
++}
++
++static void dvbridge_set_enum(struct vo_drm_state *drm, drmModeAtomicReq *request,
++                              struct drm_object *object, char *name,
++                              const char *value_name)
++{
++    uint64_t value;
++    if (dvbridge_enum_value(object, name, value_name, &value) ||
++        drm_object_set_property(request, object, name, value) < 0)
++        MP_VERBOSE(drm, "dvbridge: could not set %s to %s\n", name, value_name);
++}
++
++// Gamescope leaves AMD's private colour properties set after it loses master.
++static void dvbridge_amd_defaults(struct vo_drm_state *drm, drmModeAtomicReq *request,
++                                  struct drm_object *object)
++{
++    for (int i = 0; i < object->props->count_props; i++) {
++        drmModePropertyRes *info = object->props_info[i];
++        if (strncmp(info->name, "AMD_", 4) || (info->flags & DRM_MODE_PROP_IMMUTABLE))
++            continue;
++        uint64_t value;
++        if (drm_property_type_is(info, DRM_MODE_PROP_BLOB)) {
++            value = 0;
++        } else if (drm_property_type_is(info, DRM_MODE_PROP_ENUM)) {
++            if (dvbridge_enum_value(object, info->name, "Default", &value))
++                continue;
++        } else if (!strcmp(info->name, "AMD_PLANE_HDR_MULT")) {
++            value = 1ULL << 32;
++        } else {
++            continue;
++        }
++        if (object->props->prop_values[i] == value)
++            continue;
++        MP_VERBOSE(drm, "dvbridge: %s %llu -> %llu\n", info->name,
++                   (unsigned long long)object->props->prop_values[i],
++                   (unsigned long long)value);
++        drmModeAtomicAddProperty(request, object->id, info->prop_id, value);
++    }
++}
++
++static bool dvbridge_add_tunnel(struct vo_drm_state *drm, drmModeAtomicReq *request)
++{
++    struct drm_atomic_context *atomic_ctx = drm->atomic_context;
++    if (drm_object_set_property(request, atomic_ctx->connector,
++                                "DVBRIDGE_DV_STANDARD_LAB", 1) < 0) {
++        MP_ERR(drm, "The connector has no DVBRIDGE_DV_STANDARD_LAB property. "
++               "Is the patched amdgpu module loaded?\n");
++        return false;
++    }
++    drm_object_set_property(request, atomic_ctx->connector, "max bpc", 8);
++    drm_object_set_property(request, atomic_ctx->connector, "Colorspace",
++                            DRM_MODE_COLORIMETRY_DEFAULT);
++    drm_object_set_property(request, atomic_ctx->connector, "HDR_OUTPUT_METADATA", 0);
++    drm_object_set_property(request, atomic_ctx->crtc, "CTM", 0);
++    drm_object_set_property(request, atomic_ctx->crtc, "GAMMA_LUT", 0);
++    drm_object_set_property(request, atomic_ctx->crtc, "DEGAMMA_LUT", 0);
++    drm_object_set_property(request, atomic_ctx->crtc, "VRR_ENABLED", 0);
++    dvbridge_set_enum(drm, request, atomic_ctx->draw_plane, "rotation", "rotate-0");
++    drm_object_set_property(request, atomic_ctx->draw_plane, "alpha", 0xffff);
++    dvbridge_set_enum(drm, request, atomic_ctx->draw_plane, "pixel blend mode", "None");
++    drm_object_set_property(request, atomic_ctx->draw_plane, "COLOR_PIPELINE", 0);
++    dvbridge_amd_defaults(drm, request, atomic_ctx->crtc);
++    dvbridge_amd_defaults(drm, request, atomic_ctx->draw_plane);
++
++    // Every other plane on this CRTC (cursor, overlays) has to be off.
++    drmModePlaneRes *res = drmModeGetPlaneResources(drm->fd);
++    for (uint32_t i = 0; res && i < res->count_planes; i++) {
++        if (res->planes[i] == atomic_ctx->draw_plane->id)
++            continue;
++        drmModePlane *plane = drmModeGetPlane(drm->fd, res->planes[i]);
++        if (plane && plane->crtc_id == drm->crtc_id) {
++            struct drm_object *object = drm_object_create(drm->log, drm->fd,
++                                                          plane->plane_id,
++                                                          DRM_MODE_OBJECT_PLANE);
++            if (object) {
++                MP_VERBOSE(drm, "dvbridge: turning off plane %u\n", plane->plane_id);
++                drm_object_set_property(request, object, "FB_ID", 0);
++                drm_object_set_property(request, object, "CRTC_ID", 0);
++                drm_object_free(object);
++            }
++        }
++        drmModeFreePlane(plane);
++    }
++    drmModeFreePlaneResources(res);
++    return true;
++}
++
+ bool vo_drm_acquire_crtc(struct vo_drm_state *drm)
+ {
+     if (drm->active)
+@@ -377,7 +484,11 @@ bool vo_drm_acquire_crtc(struct vo_drm_state *drm)
+     MP_VERBOSE(drm, "crtc is%s VRR capable\n", vrr_capable ? "" : " not");
+ 
+     uint64_t vrr_requested = drm->opts->vrr_enabled;
+-    if (vrr_requested == 1 || (vrr_capable && vrr_requested == -1)) {
++    if (drm->opts->dvbridge) {
++        if (!dvbridge_add_tunnel(drm, request))
++            goto err;
++        MP_INFO(drm, "Dolby Vision tunnel requested on the connector\n");
++    } else if (vrr_requested == 1 || (vrr_capable && vrr_requested == -1)) {
+         if (drm_object_set_property(request, atomic_ctx->crtc, "VRR_ENABLED", 1) < 0) {
+             MP_WARN(drm, "Could not enable VRR on crtc\n");
+         } else {
+@@ -432,6 +543,9 @@ void vo_drm_release_crtc(struct vo_drm_state *drm)
+         success = false;
+     }
+ 
++    if (request && drm->opts->dvbridge)
++        drm_object_set_property(request, atomic_ctx->connector, "DVBRIDGE_DV_STANDARD_LAB", 0);
++
+     if (request) {
+         if (drmModeAtomicCommit(drm->fd, request, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL)) {
+             MP_WARN(drm, "Failed to commit ModeSetting atomic request: %s\n",
+@@ -1358,6 +1472,9 @@ double vo_drm_get_display_fps(struct vo_drm_state *drm)
+ bool vo_drm_set_hdr_metadata(struct vo *vo, bool force_sdr)
+ {
+     struct vo_drm_state *drm = vo->drm;
++    // The tunnel carries its own metadata and needs the default colorimetry.
++    if (drm->opts->dvbridge)
++        return false;
+     struct mp_image_params target_params = vo_get_target_params(vo);
+     if (!force_sdr && (pl_color_space_equal(&target_params.color, &drm->target_params.color) ||
+         !target_params.w || !target_params.h))
+diff --git a/video/out/drm_common.h b/video/out/drm_common.h
+index ad984e9..091c005 100644
+--- a/video/out/drm_common.h
++++ b/video/out/drm_common.h
+@@ -108,6 +108,7 @@ struct drm_opts {
+     int drm_format;
+     struct m_geometry draw_surface_size;
+     int vrr_enabled;
++    bool dvbridge;
+ };
+ 
+ struct vt_switcher {
+diff --git a/video/out/dvbridge.h b/video/out/dvbridge.h
+new file mode 100644
+index 0000000..2a3845f
+--- /dev/null
++++ b/video/out/dvbridge.h
+@@ -0,0 +1,302 @@
++/*
++ * Dolby Vision tunnel metadata for the amdgpu DVBRIDGE_DV_STANDARD_LAB output.
++ *
++ * Ported from the dvbridge serializer in LibreELEC Hades
++ * (projects/Generic/patches/kodi/kodi-9990-native-dv.patch,
++ * tools/dvbridge/dvbridge_metadata.h), GPL-3.0-or-later.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Differences from Hades: the CM v4.0 levels (3, 4, 8-11, 254) need the raw
++ * RPU bytes from a patched FFmpeg, so they are left out and counted instead.
++ * The geometry check accepts any destination rectangle mpv picks.
++ */
++
++#ifndef MP_DVBRIDGE_H
++#define MP_DVBRIDGE_H
++
++#include <math.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++
++#include <libavutil/dovi_meta.h>
++
++#define DVBRIDGE_W 3840
++#define DVBRIDGE_H 2160
++
++struct dvbridge_dv {
++    uint8_t payload[512], previous[512];
++    unsigned size, previous_size, id;
++    // One byte per element, four elements per uvec4 of the shader's
++    // metadata_words array.
++    uint32_t packets[512];
++    unsigned count;
++    uint64_t frames, changes;
++    double last_pts;
++    int source_w, source_h, dest_x, dest_y, dest_w, dest_h;
++    // Margins of the active picture in the 3840x2160 raster: left, right,
++    // top, bottom.
++    unsigned margins[4];
++    unsigned cm4_omitted;
++};
++
++#define DV_REQUIRE(x) do { if (!(x)) return false; } while (0)
++
++// A profile 7 minimal enhancement layer adds nothing to the base layer, so
++// the frame can be treated as profile 8.1. The test is dovi_tool's is_mel():
++// zero NLQ offset, vdr_in_max of exactly 1.0, and zero deadzone slope and
++// threshold on every component. Only fixed-point coefficients are checked.
++static inline bool dvbridge_dovi_is_mel(const AVDOVIMetadata *m)
++{
++    const AVDOVIRpuDataHeader *h = av_dovi_get_header(m);
++    const AVDOVIDataMapping *map = av_dovi_get_mapping(m);
++    DV_REQUIRE(!h->disable_residual_flag && h->coef_data_type == 0 &&
++               h->coef_log2_denom < 64 && map->nlq_method_idc == AV_DOVI_NLQ_LINEAR_DZ);
++    for (int i = 0; i < 3; i++) {
++        const AVDOVINLQParams *nlq = &map->nlq[i];
++        DV_REQUIRE(nlq->nlq_offset == 0 && nlq->vdr_in_max == 1ULL << h->coef_log2_denom &&
++                   nlq->linear_deadzone_slope == 0 && nlq->linear_deadzone_threshold == 0);
++    }
++    return true;
++}
++
++static inline bool dvbridge_dv_bounds(const AVDOVIMetadata *m, size_t bytes)
++{
++    DV_REQUIRE(m && bytes >= sizeof(*m));
++#define DV_REGION(field, type) \
++    DV_REQUIRE(m->field >= sizeof(*m) && m->field <= bytes && \
++               bytes - m->field >= sizeof(type) && m->field % _Alignof(type) == 0)
++    DV_REGION(header_offset, AVDOVIRpuDataHeader);
++    DV_REGION(color_offset, AVDOVIColorMetadata);
++    DV_REGION(mapping_offset, AVDOVIDataMapping);
++    DV_REGION(ext_block_offset, AVDOVIDmData);
++#undef DV_REGION
++    DV_REQUIRE(m->num_ext_blocks > 0 && m->num_ext_blocks <= AV_DOVI_MAX_EXT_BLOCKS);
++    DV_REQUIRE(m->ext_block_size >= sizeof(AVDOVIDmData) &&
++               m->ext_block_size % _Alignof(AVDOVIDmData) == 0);
++    return (size_t)m->num_ext_blocks <= (bytes - m->ext_block_offset) / m->ext_block_size;
++}
++
++// All scaling and letterboxing happen before packing, so L5 describes the
++// final HDMI raster, not the decoded frame.
++static inline bool dvbridge_dv_geometry(struct dvbridge_dv *d, int w, int h,
++                                        int x, int y, int dw, int dh)
++{
++    DV_REQUIRE(w > 0 && h > 0 && w <= DVBRIDGE_W && h <= DVBRIDGE_H);
++    DV_REQUIRE(dw > 0 && dh > 0 && x >= 0 && y >= 0 &&
++               x + dw <= DVBRIDGE_W && y + dh <= DVBRIDGE_H);
++    d->source_w = w; d->source_h = h;
++    d->dest_x = x; d->dest_y = y; d->dest_w = dw; d->dest_h = dh;
++    return true;
++}
++
++static inline bool dvbridge_dv_area(struct dvbridge_dv *d, unsigned l, unsigned r,
++                                    unsigned t, unsigned b, unsigned v[4])
++{
++    int w = d->source_w ? d->source_w : DVBRIDGE_W;
++    int h = d->source_h ? d->source_h : DVBRIDGE_H;
++    int dw = d->dest_w ? d->dest_w : DVBRIDGE_W;
++    int dh = d->dest_h ? d->dest_h : DVBRIDGE_H;
++    DV_REQUIRE(l < (unsigned)w && r < (unsigned)w - l && t < (unsigned)h && b < (unsigned)h - t);
++    v[0] = d->dest_x + lround((double)l * dw / w);
++    v[1] = DVBRIDGE_W - d->dest_x - dw + lround((double)r * dw / w);
++    v[2] = d->dest_y + lround((double)t * dh / h);
++    v[3] = DVBRIDGE_H - d->dest_y - dh + lround((double)b * dh / h);
++    return v[0] + v[1] < DVBRIDGE_W && v[2] + v[3] < DVBRIDGE_H;
++}
++
++static inline void dvbridge_dv_u16(struct dvbridge_dv *d, unsigned v)
++{
++    d->payload[d->size++] = v >> 8;
++    d->payload[d->size++] = v;
++}
++
++static inline void dvbridge_dv_u32(struct dvbridge_dv *d, unsigned v)
++{
++    dvbridge_dv_u16(d, v >> 16);
++    dvbridge_dv_u16(d, v & 65535);
++}
++
++// CRC-32/MPEG-2: MSB first, no reflection, no final XOR.
++static inline uint32_t dvbridge_dv_crc(const uint8_t *p, size_t n)
++{
++    uint32_t c = 0xffffffff;
++    for (size_t j = 0; j < n; j++) {
++        c ^= (uint32_t)p[j] << 24;
++        for (int i = 0; i < 8; i++)
++            c = (c << 1) ^ ((c >> 31) ? 0x04c11db7u : 0);
++    }
++    return c;
++}
++
++// Builds the packets for the frame being drawn. Takes the RPU of that exact
++// frame, not the decoder's newest one. A repeated PTS (pause, redraw) keeps
++// the payload stable, and a jump in PTS forces a scene refresh so no stale
++// metadata survives a seek. On failure the previous packets stay in place.
++static inline bool dvbridge_dv_metadata(struct dvbridge_dv *d, const AVDOVIMetadata *m,
++                                        double pts)
++{
++    DV_REQUIRE(m && isfinite(pts));
++    const AVDOVIColorMetadata *c = av_dovi_get_color(m);
++    const AVDOVIRpuDataHeader *h = av_dovi_get_header(m);
++    // Profiles 5, 8 and 7 MEL. Profile 7 FEL needs the enhancement layer.
++    DV_REQUIRE(c && h && (h->disable_residual_flag == 1 || dvbridge_dovi_is_mel(m)));
++    DV_REQUIRE(c->signal_eotf == 65535 && (c->signal_color_space == 0 || c->signal_color_space == 2));
++    DV_REQUIRE(!c->signal_eotf_param0 && !c->signal_eotf_param1 && !c->signal_eotf_param2);
++    DV_REQUIRE(c->source_min_pq <= c->source_max_pq && c->source_max_pq <= 4095);
++    DV_REQUIRE(m->num_ext_blocks > 0 && m->num_ext_blocks <= AV_DOVI_MAX_EXT_BLOCKS);
++
++    struct dvbridge_dv n = *d;
++    bool repeat = d->frames && pts == d->last_pts;
++    bool refresh = !d->frames || pts < d->last_pts || pts - d->last_pts > 0.1;
++    n.size = 0;
++    n.payload[n.size++] = 0;
++    n.payload[n.size++] = repeat ? d->previous[1] : refresh ? 1 : c->scene_refresh_flag;
++    static const int matrix[] = {9574, 0, 13802, 9574, -1540, -5348, 9574, 17610, 0};
++    static const unsigned lms[] = {7222, 8771, 390, 2654, 12430, 1300, 0, 422, 15962};
++    for (int i = 0; i < 9; i++)
++        dvbridge_dv_u16(&n, (uint16_t)matrix[i]);
++    dvbridge_dv_u32(&n, 16777216);
++    dvbridge_dv_u32(&n, 134217728);
++    dvbridge_dv_u32(&n, 134217728);
++    for (int i = 0; i < 9; i++)
++        dvbridge_dv_u16(&n, lms[i]);
++    dvbridge_dv_u16(&n, 65535);
++    dvbridge_dv_u32(&n, 0);
++    dvbridge_dv_u32(&n, 0);
++    n.payload[n.size++] = 12;
++    n.payload[n.size++] = 0;
++    n.payload[n.size++] = 1;
++    n.payload[n.size++] = 1;
++    dvbridge_dv_u16(&n, c->source_min_pq);
++    dvbridge_dv_u16(&n, c->source_max_pq);
++    dvbridge_dv_u16(&n, 42);
++    unsigned count_pos = n.size++;
++    n.payload[count_pos] = 0;
++
++    // Levels in ascending order, as Hades sends them.
++    const AVDOVIDmData *ordered[AV_DOVI_MAX_EXT_BLOCKS];
++    unsigned order[AV_DOVI_MAX_EXT_BLOCKS];
++    for (int i = 0; i < m->num_ext_blocks; i++) {
++        const AVDOVIDmData *e = av_dovi_get_ext(m, i);
++        int j = i;
++        while (j > 0 && order[j - 1] > e->level) {
++            ordered[j] = ordered[j - 1];
++            order[j] = order[j - 1];
++            j--;
++        }
++        ordered[j] = e;
++        order[j] = e->level;
++    }
++
++    unsigned l1 = 0, area = 0, targets[AV_DOVI_MAX_EXT_BLOCKS], ntargets = 0;
++    n.cm4_omitted = 0;
++    unsigned margins[4];
++    bool have_margins = false;
++    for (int i = 0; i < m->num_ext_blocks; i++) {
++        const AVDOVIDmData *e = ordered[i];
++        unsigned v[7] = {0}, k = 0;
++        DV_REQUIRE(n.size + 20 < sizeof(n.payload));
++        switch (e->level) {
++        case 1:
++            DV_REQUIRE(!area);
++            l1++;
++            k = 3;
++            v[0] = e->l1.min_pq; v[1] = e->l1.max_pq; v[2] = e->l1.avg_pq;
++            DV_REQUIRE(v[0] <= v[2] && v[2] <= v[1]);
++            break;
++        case 2:
++            DV_REQUIRE(!area);
++            k = 7;
++            v[0] = e->l2.target_max_pq; v[1] = e->l2.trim_slope; v[2] = e->l2.trim_offset;
++            v[3] = e->l2.trim_power; v[4] = e->l2.trim_chroma_weight;
++            v[5] = e->l2.trim_saturation_gain; v[6] = (uint16_t)e->l2.ms_weight;
++            for (unsigned j = 0; j < ntargets; j++)
++                DV_REQUIRE(targets[j] != v[0]);
++            targets[ntargets++] = v[0];
++            break;
++        case 5:
++            area++;
++            DV_REQUIRE(l1 == 1 && area == 1);
++            k = 4;
++            DV_REQUIRE(dvbridge_dv_area(&n, e->l5.left_offset, e->l5.right_offset,
++                                        e->l5.top_offset, e->l5.bottom_offset, v));
++            memcpy(margins, v, sizeof(margins));
++            have_margins = true;
++            break;
++        case 3: case 4: case 8: case 9: case 10: case 11: case 254:
++            n.cm4_omitted++;
++            continue;
++        case 6:
++            continue; // static HDR10 fallback, not dynamic DV data
++        default:
++            return false;
++        }
++        for (unsigned j = 0; j < k; j++)
++            DV_REQUIRE(v[j] <= 4095 || (e->level == 2 && j == 6 && v[j] == 65535));
++        dvbridge_dv_u32(&n, k * 2);
++        n.payload[n.size++] = e->level;
++        for (unsigned j = 0; j < k; j++)
++            dvbridge_dv_u16(&n, v[j]);
++        n.payload[count_pos]++;
++    }
++    DV_REQUIRE(l1 == 1);
++    if (!area) {
++        unsigned v[4];
++        DV_REQUIRE(dvbridge_dv_area(&n, 0, 0, 0, 0, v));
++        DV_REQUIRE(n.size + 13 < sizeof(n.payload));
++        dvbridge_dv_u32(&n, 8);
++        n.payload[n.size++] = 5;
++        for (int j = 0; j < 4; j++)
++            dvbridge_dv_u16(&n, v[j]);
++        n.payload[count_pos]++;
++        memcpy(margins, v, sizeof(margins));
++        have_margins = true;
++    }
++    DV_REQUIRE(have_margins && n.size <= 482 && n.payload[count_pos] <= AV_DOVI_MAX_EXT_BLOCKS);
++
++    if (d->frames && (d->previous_size != n.size || memcmp(d->previous, n.payload, n.size))) {
++        n.id = (n.id + 1) & 15;
++        n.changes++;
++    }
++    memcpy(n.previous, n.payload, n.size);
++    n.previous_size = n.size;
++    n.count = n.size <= 119 ? 1 : 1 + (n.size - 119 + 120) / 121;
++    DV_REQUIRE(n.count <= 4);
++    memset(n.packets, 0, sizeof(n.packets));
++    unsigned off = 0;
++    for (unsigned i = 0; i < n.count; i++) {
++        uint8_t p[128] = {0};
++        p[0] = (n.count == 1 ? 0 : i == 0 ? 1 : i + 1 == n.count ? 3 : 2) << 6;
++        p[1] = (n.id << 4) | n.id;
++        unsigned start = i ? 3 : 5, room = i ? 121 : 119;
++        unsigned take = n.size - off;
++        if (take > room)
++            take = room;
++        if (!i) {
++            p[3] = n.size >> 8;
++            p[4] = n.size;
++        }
++        memcpy(p + start, n.payload + off, take);
++        off += take;
++        uint32_t crc = dvbridge_dv_crc(p, 124);
++        for (int j = 0; j < 4; j++)
++            p[124 + j] = crc >> (24 - j * 8);
++        DV_REQUIRE(!dvbridge_dv_crc(p, 128));
++        for (unsigned j = 0; j < 128; j++)
++            n.packets[i * 128 + j] = p[j];
++    }
++    memcpy(n.margins, margins, sizeof(margins));
++    n.last_pts = pts;
++    n.frames++;
++    *d = n;
++    return true;
++}
++
++#undef DV_REQUIRE
++
++#endif
+diff --git a/video/out/opengl/context_drm_egl.c b/video/out/opengl/context_drm_egl.c
+index fc78f13..1b10143 100644
+--- a/video/out/opengl/context_drm_egl.c
++++ b/video/out/opengl/context_drm_egl.c
+@@ -560,6 +560,10 @@ static bool drm_egl_init(struct ra_ctx *ctx)
+         break;
+     }
+ 
++    // The Dolby Vision tunnel scans out XRGB8888 and nothing else.
++    if (drm->opts->dvbridge)
++        argb_format = xrgb_format = GBM_FORMAT_XRGB8888;
++
+     if (!probe_gbm_format(ctx, argb_format, xrgb_format)) {
+         MP_ERR(ctx->vo, "No suitable format found on draw plane (tried: %s and %s).\n",
+                gbm_format_to_string(argb_format), gbm_format_to_string(xrgb_format));
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 2d95eb8..5c5ae30 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -27,6 +27,10 @@
+ #include <libplacebo/shaders/icc.h>
+ #include <libplacebo/utils/libav.h>
+ #include <libplacebo/utils/frame_queue.h>
++#include <libplacebo/dispatch.h>
++#include <libplacebo/shaders/custom.h>
++
++#include <libavutil/frame.h>
+ 
+ #include "config.h"
+ #include "common/common.h"
+@@ -48,6 +52,11 @@
+ #include "gpu/video_shaders.h"
+ #include "sub/osd.h"
+ #include "gpu_next/context.h"
++#include "dvbridge.h"
++
++#if HAVE_DRM
++#include "drm_common.h"
++#endif
+ 
+ #if HAVE_GL && defined(PL_HAVE_OPENGL)
+ #include <libplacebo/opengl.h>
+@@ -158,6 +167,14 @@ struct priv {
+     struct frame_info perf_redraw;
+ 
+     struct mp_image_params target_params;
++
++    // Dolby Vision tunnel (--drm-dvbridge): the frame is rendered in PQ
++    // BT.2020 to dv_tex, then packed into the swapchain by dv_dp.
++    bool dv_enabled;
++    pl_tex dv_tex;
++    pl_dispatch dv_dp;
++    struct dvbridge_dv dv;
++    bool dv_warned_size, dv_warned_meta, dv_warned_cm4;
+ };
+ 
+ static void update_render_options(struct vo *vo);
+@@ -1002,6 +1019,182 @@ static enum pl_color_primaries get_best_prim_container(const struct pl_raw_prima
+ static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
+                                      const struct mp_image *mpi);
+ 
++// The pack pass needs the PQ values at full precision, so the frame and the
++// OSD are rendered to a float texture first.
++static bool dv_prepare_target(struct vo *vo, struct pl_frame *target,
++                              const struct pl_swapchain_frame *swframe)
++{
++    struct priv *p = vo->priv;
++    pl_tex fbo = swframe->fbo;
++    if (fbo->params.w != DVBRIDGE_W || fbo->params.h != DVBRIDGE_H) {
++        if (!p->dv_warned_size) {
++            MP_ERR(vo, "The Dolby Vision tunnel needs a %dx%d output, got %dx%d.\n",
++                   DVBRIDGE_W, DVBRIDGE_H, fbo->params.w, fbo->params.h);
++        }
++        p->dv_warned_size = true;
++        return false;
++    }
++
++    pl_fmt fmt = pl_find_named_fmt(p->gpu, "rgba32f");
++    // blit_dst because libplacebo clears the letterbox bars with pl_tex_clear.
++    enum pl_fmt_caps caps = PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE |
++                            PL_FMT_CAP_BLITTABLE;
++    if (!fmt || (fmt->caps & caps) != caps ||
++        !pl_tex_recreate(p->gpu, &p->dv_tex, pl_tex_params(
++            .w = DVBRIDGE_W,
++            .h = DVBRIDGE_H,
++            .format = fmt,
++            .renderable = true,
++            .sampleable = true,
++            .blit_dst = true,
++        )))
++    {
++        MP_ERR(vo, "Could not create the Dolby Vision intermediate texture.\n");
++        return false;
++    }
++
++    target->planes[0].texture = p->dv_tex;
++    target->planes[0].flipped = false;
++    target->repr = pl_color_repr_rgb;
++    target->icc = NULL;
++    target->lut = NULL;
++    return true;
++}
++
++// Builds the packets from the RPU of the frame on screen. Without a usable
++// RPU the previous packets stay, so one bad frame doesn't drop the TV out of
++// Dolby Vision.
++static void dv_update(struct vo *vo, const struct pl_frame_mix *mix,
++                      struct pl_frame *target)
++{
++    struct priv *p = vo->priv;
++    const struct pl_frame *cur = mix->num_frames ? pl_frame_mix_nearest(mix) : NULL;
++
++    // The pack pass expects PQ BT.2020. With the target in the frame's own
++    // mapped colour space, libplacebo doesn't tone map at all.
++    target->color = pl_color_space_hdr10;
++    if (cur && cur->color.primaries == PL_COLOR_PRIM_BT_2020 &&
++        cur->color.transfer == PL_COLOR_TRC_PQ)
++        target->color = cur->color;
++    if (!cur)
++        return;
++
++    struct mp_image *mpi = cur->user_data;
++    const AVBufferRef *buf = NULL;
++    for (int n = 0; n < mpi->num_ff_side_data; n++) {
++        if (mpi->ff_side_data[n].type == AV_FRAME_DATA_DOVI_METADATA)
++            buf = mpi->ff_side_data[n].buf;
++    }
++
++    // L5 offsets count decoded pixels, and the packets describe the raster.
++    pl_rect2df dst = target->crop;
++    pl_rect2df_normalize(&dst);
++    const AVDOVIMetadata *m = buf ? (const AVDOVIMetadata *)buf->data : NULL;
++    bool ok = m && dvbridge_dv_bounds(m, buf->size) &&
++              dvbridge_dv_geometry(&p->dv, mpi->w, mpi->h,
++                                   lroundf(dst.x0), lroundf(dst.y0),
++                                   lroundf(pl_rect_w(dst)), lroundf(pl_rect_h(dst))) &&
++              dvbridge_dv_metadata(&p->dv, m, mpi->pts);
++
++    if (!ok && !p->dv_warned_meta) {
++        MP_WARN(vo, "No usable Dolby Vision profile 5 or 8 metadata at %f, "
++                "keeping the previous packets.\n", mpi->pts);
++        p->dv_warned_meta = true;
++    }
++    if (ok && p->dv.cm4_omitted && !p->dv_warned_cm4) {
++        MP_WARN(vo, "Leaving out %u CM v4.0 metadata blocks per frame.\n",
++                p->dv.cm4_omitted);
++        p->dv_warned_cm4 = true;
++    }
++    if (ok) {
++        MP_TRACE(vo, "DV packets: %u, payload %u bytes, id %u\n",
++                 p->dv.count, p->dv.size, p->dv.id);
++    }
++}
++
++// Packs the PQ RGB intermediate into the tunnel: 12-bit limited-range BT.2020
++// Y'CbCr 4:2:2 in 8-bit RGB, with the metadata packets in the chroma LSBs.
++// Each packet covers 3072 pixels, its 1024 bits sent three times over.
++static bool dv_pack(struct vo *vo, const struct pl_swapchain_frame *swframe)
++{
++    struct priv *p = vo->priv;
++    unsigned count = p->dv.count;
++    unsigned flip = swframe->flipped;
++
++    pl_shader sh = pl_dispatch_begin(p->dv_dp);
++    bool ok = pl_shader_custom(sh, &(struct pl_custom_shader) {
++        .description = "dolby vision tunnel",
++        .output = PL_SHADER_SIG_COLOR,
++        .header =
++            "uint dv_parity(uint v)            \n"
++            "{                                 \n"
++            "    v ^= v >> 16u;                \n"
++            "    v ^= v >> 8u;                 \n"
++            "    v ^= v >> 4u;                 \n"
++            "    v ^= v >> 2u;                 \n"
++            "    v ^= v >> 1u;                 \n"
++            "    return v & 1u;                \n"
++            "}                                 \n",
++        .body =
++            "ivec2 p = ivec2(gl_FragCoord.xy);\n"
++            "if (flip_y != 0u)\n"
++            "    p.y = 2159 - p.y;\n"
++            "ivec2 q = ivec2(p.x & ~1, p.y);\n"
++            "vec3 a = clamp(texelFetch(pq_input, q, 0).rgb, 0.0, 1.0);\n"
++            "vec3 b = clamp(texelFetch(pq_input, q + ivec2(1, 0), 0).rgb, 0.0, 1.0);\n"
++            "float ya = dot(a, vec3(0.2627, 0.6780, 0.0593));\n"
++            "float yb = dot(b, vec3(0.2627, 0.6780, 0.0593));\n"
++            "uint y = uint(floor(256.0 + 3504.0 * ((p.x & 1) == 0 ? ya : yb) + 0.5));\n"
++            "float cb = 2048.0 + 3584.0 * ((a.b - ya) + (b.b - yb)) / (2.0 * 1.8814);\n"
++            "float cr = 2048.0 + 3584.0 * ((a.r - ya) + (b.r - yb)) / (2.0 * 1.4746);\n"
++            "uint c = uint(floor(((p.x & 1) == 0 ? cb : cr) + 0.5));\n"
++            "uint index = uint(p.y * 3840 + p.x);\n"
++            "uint packet = index / 3072u;\n"
++            "if (packet < packet_count) {\n"
++            "    uint bit = index % 1024u;\n"
++            "    uint byte_index = packet * 128u + bit / 8u;\n"
++            "    uint v = (metadata_words[byte_index / 4u][int(byte_index % 4u)]\n"
++            "              >> (7u - bit % 8u)) & 1u;\n"
++            "    c = (c & 4094u) | (v ^ dv_parity(c >> 1u) ^ dv_parity(y));\n"
++            "}\n"
++            "color = vec4(float(c >> 4u), float(y >> 4u),\n"
++            "             float((y & 15u) | ((c & 15u) << 4u)), 255.0) / 255.0;\n",
++        .descriptors = &(struct pl_shader_desc) {
++            .desc = { .name = "pq_input", .type = PL_DESC_SAMPLED_TEX },
++            .binding = {
++                .object = p->dv_tex,
++                .address_mode = PL_TEX_ADDRESS_CLAMP,
++                .sample_mode = PL_TEX_SAMPLE_NEAREST,
++            },
++        },
++        .num_descriptors = 1,
++        .variables = (struct pl_shader_var[]) {
++            {
++                .var = {
++                    .name = "metadata_words",
++                    .type = PL_VAR_UINT,
++                    .dim_v = 4,
++                    .dim_m = 1,
++                    .dim_a = MP_ARRAY_SIZE(p->dv.packets) / 4,
++                },
++                .data = p->dv.packets,
++                .dynamic = true,
++            },
++            { .var = pl_var_uint("packet_count"), .data = &count, .dynamic = true },
++            { .var = pl_var_uint("flip_y"), .data = &flip },
++        },
++        .num_variables = 3,
++    });
++    if (!ok) {
++        pl_dispatch_abort(p->dv_dp, &sh);
++        return false;
++    }
++    return pl_dispatch_finish(p->dv_dp, pl_dispatch_params(
++        .shader = &sh,
++        .target = swframe->fbo,
++    ));
++}
++
+ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ {
+     struct priv *p = vo->priv;
+@@ -1022,6 +1215,13 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     params.preserve_mixing_cache = p->next_opts->inter_preserve && !frame->still;
+     if (frame->still)
+         params.frame_mixer = NULL;
++    if (p->dv_enabled) {
++        // One decoded frame per output frame, so the metadata matches the
++        // picture, and no dither or peak detection changing the PQ values.
++        params.frame_mixer = NULL;
++        params.dither_params = NULL;
++        params.peak_detect_params = NULL;
++    }
+ 
+     if (frame->current && frame->current->params.vflip) {
+         pl_matrix2x2 m = { .m = {{1, 0}, {0, -1}}, };
+@@ -1308,6 +1508,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current);
+     apply_crop(&target, p->dst, swframe.fbo->params.w, swframe.fbo->params.h);
+     update_tm_viz(&pars->color_map_params, &target);
++    bool dv_ready = !p->dv_enabled || dv_prepare_target(vo, &target, &swframe);
+ 
+     struct pl_frame_mix mix = {0};
+     if (frame->current) {
+@@ -1403,12 +1604,37 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+             update_hook_opts_dynamic(p, p->hooks[i], frame->current);
+     }
+ 
++    // Bail out only after the queue update, so frames don't pile up in it.
++    if (!dv_ready)
++        goto done;
++
++    struct pl_color_map_params dv_cmap;
++    if (p->dv_enabled) {
++        dv_update(vo, &mix, &target);
++        // Source and target match, so these only make sure nothing reshapes
++        // the values if libplacebo still decides to map.
++        dv_cmap = params.color_map_params ? *params.color_map_params
++                                          : pl_color_map_default_params;
++        dv_cmap.tone_mapping_function = &pl_tone_map_clip;
++        dv_cmap.gamut_mapping = &pl_gamut_map_clip;
++        dv_cmap.inverse_tone_mapping = false;
++        dv_cmap.contrast_recovery = 0;
++        dv_cmap.visualize_lut = false;
++        dv_cmap.show_clipping = false;
++        params.color_map_params = &dv_cmap;
++    }
++
+     // Render frame
+     if (!pl_render_image_mix(p->rr, &mix, &target, &params)) {
+         MP_ERR(vo, "Failed rendering frame!\n");
+         goto done;
+     }
+ 
++    if (p->dv_enabled && !dv_pack(vo, &swframe)) {
++        MP_ERR(vo, "Failed packing the Dolby Vision frame!\n");
++        goto done;
++    }
++
+     struct pl_frame ref_frame;
+     pl_frames_infer_mix(p->rr, &mix, &target, &ref_frame);
+ 
+@@ -2107,6 +2333,8 @@ static void uninit(struct vo *vo)
+ 
+     pl_icc_close(&p->icc_profile);
+     pl_renderer_destroy(&p->rr);
++    pl_dispatch_destroy(&p->dv_dp);
++    pl_tex_destroy(p->gpu, &p->dv_tex);
+ 
+     for (int i = 0; i < VO_PASS_PERF_MAX; ++i) {
+         pl_shader_info_deref(&p->perf_fresh.info[i].shader);
+@@ -2172,6 +2400,14 @@ static int preinit(struct vo *vo)
+     p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
+     p->osd_sync = 1;
+ 
++#if HAVE_DRM
++    if (!strcmp(p->ra_ctx->fns->name, "drm") && vo->drm && vo->drm->opts->dvbridge) {
++        p->dv_enabled = true;
++        p->dv_dp = pl_dispatch_create(p->pllog, p->gpu);
++        MP_INFO(vo, "Packing video into the Dolby Vision tunnel.\n");
++    }
++#endif
++
+     p->pars = pl_options_alloc(p->pllog);
+     update_render_options(vo);
+     return 0;
