@@ -1,5 +1,5 @@
 diff --git a/video/out/drm_common.c b/video/out/drm_common.c
-index c7e999b..c7f1384 100644
+index c7e999b..553ae51 100644
 --- a/video/out/drm_common.c
 +++ b/video/out/drm_common.c
 @@ -104,6 +104,7 @@ const struct m_sub_options drm_conf = {
@@ -10,7 +10,7 @@ index c7e999b..c7f1384 100644
          {0},
      },
      .defaults = &(const struct drm_opts) {
-@@ -313,6 +314,112 @@ static void vt_switcher_handle_event(struct vt_switcher *s)
+@@ -313,6 +314,114 @@ static void vt_switcher_handle_event(struct vt_switcher *s)
      }
  }
  
@@ -83,6 +83,8 @@ index c7e999b..c7f1384 100644
 +        return false;
 +    }
 +    drm_object_set_property(request, atomic_ctx->connector, "max bpc", 8);
++    // Gamescope sets Game, which makes an LG switch to its Game Optimizer.
++    dvbridge_set_enum(drm, request, atomic_ctx->connector, "content type", "No Data");
 +    drm_object_set_property(request, atomic_ctx->connector, "Colorspace",
 +                            DRM_MODE_COLORIMETRY_DEFAULT);
 +    drm_object_set_property(request, atomic_ctx->connector, "HDR_OUTPUT_METADATA", 0);
@@ -123,7 +125,7 @@ index c7e999b..c7f1384 100644
  bool vo_drm_acquire_crtc(struct vo_drm_state *drm)
  {
      if (drm->active)
-@@ -362,7 +469,11 @@ bool vo_drm_acquire_crtc(struct vo_drm_state *drm)
+@@ -362,7 +471,11 @@ bool vo_drm_acquire_crtc(struct vo_drm_state *drm)
      MP_VERBOSE(drm, "crtc is%s VRR capable\n", vrr_capable ? "" : " not");
  
      uint64_t vrr_requested = drm->opts->vrr_enabled;
@@ -136,7 +138,7 @@ index c7e999b..c7f1384 100644
          if (drm_object_set_property(request, atomic_ctx->crtc, "VRR_ENABLED", 1) < 0) {
              MP_WARN(drm, "Could not enable VRR on crtc\n");
          } else {
-@@ -417,6 +528,9 @@ void vo_drm_release_crtc(struct vo_drm_state *drm)
+@@ -417,6 +530,9 @@ void vo_drm_release_crtc(struct vo_drm_state *drm)
          success = false;
      }
  
@@ -146,7 +148,7 @@ index c7e999b..c7f1384 100644
      if (request) {
          if (drmModeAtomicCommit(drm->fd, request, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL)) {
              MP_WARN(drm, "Failed to commit ModeSetting atomic request: %s\n",
-@@ -1373,6 +1487,9 @@ double vo_drm_get_display_fps(struct vo_drm_state *drm)
+@@ -1373,6 +1489,9 @@ double vo_drm_get_display_fps(struct vo_drm_state *drm)
  bool vo_drm_set_color(struct vo *vo, struct pl_color_space *color)
  {
      struct vo_drm_state *drm = vo->drm;

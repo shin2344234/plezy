@@ -1,0 +1,490 @@
+#!/usr/bin/python3 -I
+# Starts the Dolby Vision tunnel for Plezy. Runs as root through the sudoers
+# rule in dvtunnel.sudoers, so the deck user can run it and nothing else as root.
+#
+#   dv-tunnel probe      exits 0 when the kernel offers the tunnel and the TV's
+#                        Dolby block lists the Standard interface
+#   dv-tunnel play HZ    switches to tty2 and runs mpv idle with the tunnel on
+#                        at 3840x2160 and HZ, then speaks mpv's JSON IPC on
+#                        stdin and stdout until mpv quits or stdin closes
+#
+# mpv runs as root, and its IPC can run programs ("run", "subprocess") and
+# write files through options such as af and stream-record. So the helper sits
+# between Plezy and mpv's IPC and passes only the commands, properties and
+# loadfile options Plezy uses, with URLs limited to http and https.
+import json
+import os
+import re
+import selectors
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import time
+
+ROOT = "/var/lib/dvtunnel"
+MPV = ROOT + "/mpv"
+DVFRAME = ROOT + "/dvframe"
+LOG = ROOT + "/play.log"
+RATES = {"23.98", "24", "25", "29.97", "30", "50", "59.94", "60"}
+MAX_LINE = 1 << 20
+
+MPV_ARGS = [
+    "--no-config",
+    "--idle=yes",
+    "--terminal=no",
+    "--load-scripts=no",
+    # The built-in scripts load apart from --load-scripts. mpv runs as root,
+    # and the ytdl hook would start yt-dlp on a URL that fails to open.
+    "--ytdl=no",
+    "--load-stats-overlay=no",
+    "--load-console=no",
+    "--load-commands=no",
+    "--load-select=no",
+    "--load-positioning=no",
+    "--load-context-menu=no",
+    "--load-auto-profiles=no",
+    "--osc=no",
+    # Plezy draws its own controls through overlay-add. mpv's OSD messages
+    # would land in the picture next to them.
+    "--osd-level=0",
+    "--input-default-bindings=no",
+    "--input-conf=" + ROOT + "/input.conf",
+    "--input-gamepad=yes",
+    "--vo=gpu-next",
+    "--gpu-api=opengl",
+    "--gpu-context=drm",
+    "--drm-dvbridge",
+    # An overlay shows on the next frame mpv renders, which then waits behind
+    # every frame already queued for the display. At 23.976 Hz each queued
+    # frame delays Plezy's controls by 42 ms, and mpv's default 50 ms early
+    # render adds more. A render slower than 25 ms would show up as dropped
+    # frames in play.log.
+    "--swapchain-depth=1",
+    "--video-timing-offset=0.025",
+    "--hwdec=vaapi",
+    "--log-file=" + LOG,
+    "--msg-level=vo=v",
+]
+
+# Commands that only read state or control playback.
+PLAIN = {
+    "get_property", "get_property_string", "observe_property",
+    "observe_property_string", "unobserve_property", "request_log_messages",
+    "get_version", "client_name", "enable_event", "disable_event",
+    "seek", "stop", "quit", "frame-step", "frame-back-step", "sub-seek",
+    "sub-step", "sub-remove", "sub-reload", "playlist-remove",
+    "playlist-clear", "drop-buffers", "ao-reload",
+}
+# Commands whose first argument is a property name.
+SETTERS = {"set", "set_property", "set_property_string", "change-list", "cycle", "add", "multiply"}
+SETTABLE = {
+    "pause", "volume", "volume-max", "mute", "speed", "aid", "sid",
+    "secondary-sid", "sub-visibility", "secondary-sub-visibility",
+    "sub-delay", "audio-delay", "sub-scale", "sub-pos", "sub-font",
+    "sub-font-size", "sub-bold", "sub-italic", "sub-color",
+    "sub-border-color", "sub-border-size", "sub-border-style",
+    "sub-shadow-offset", "sub-shadow-color", "sub-back-color",
+    "sub-margin-x", "sub-margin-y", "sub-align-x", "sub-align-y", "sub-ass",
+    "sub-ass-override", "sub-ass-force-margins", "sub-use-margins",
+    "sub-spacing", "sub-blur", "sub-justify", "start", "network-timeout",
+    "demuxer-max-bytes", "demuxer-max-back-bytes", "demuxer-readahead-secs",
+    "demuxer-seekable-cache", "cache", "cache-secs", "cache-pause",
+    "cache-pause-initial", "cache-pause-wait", "force-seekable",
+    "prefetch-playlist", "audio-channels", "audio-normalize-downmix",
+    "keepaspect", "http-header-fields", "user-agent", "referrer",
+    "msg-level", "hr-seek", "loop-file", "deinterlace", "stream-buffer-size",
+    "stream-lavf-o", "demuxer-lavf-o",
+}
+LAVF = {"stream-lavf-o", "demuxer-lavf-o"}
+LAVF_KEYS = {
+    "reconnect", "reconnect_streamed", "reconnect_on_network_error",
+    "reconnect_on_http_error", "reconnect_delay_max", "live_start_index",
+}
+LOADFILE_FLAGS = {"replace", "append", "append-play", "insert-next", "insert-next-play", "insert-at", "insert-at-play"}
+LOADFILE_OPTIONS = {
+    "start", "sid", "secondary-sid", "aid", "pause", "sub-files",
+    "cache-pause-initial", "cache-pause-wait", "demuxer-lavf-o-append",
+    "http-header-fields", "http-header-fields-clr",
+}
+# Plezy writes its controls into this file as premultiplied BGRA, and mpv
+# reads them through a descriptor the helper opened, so mpv never opens a path
+# Plezy picked. The folder is root's, so Plezy can't swap the file out.
+OVERLAY_DIR = "/run/dvtunnel"
+OVERLAY = OVERLAY_DIR + "/overlay"
+OVERLAY_W, OVERLAY_H = 3840, 2160
+OVERLAY_SIZE = OVERLAY_W * OVERLAY_H * 4
+OVERLAY_IDS = 4
+# mpv's descriptor for the overlay file, once play() made it.
+overlay_fd = None
+KEY = re.compile(rb"[a-z0-9_-]+\Z")
+LENGTH_QUOTE = re.compile(rb"%(\d+)%")
+DOLBY_INTERFACES = [
+    "Low-Latency", "Low-Latency + Low-Latency-HDMI",
+    "Standard + Low-Latency", "Standard + Low-Latency-HDMI",
+]
+
+
+class Refused(Exception):
+    pass
+
+
+def check_url(url):
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        raise Refused("only http and https URLs")
+
+
+def parse_kv(text):
+    """Splits an mpv key-value list the way mpv does, refusing the quote forms Plezy never sends."""
+    data = text.encode()
+    pairs = []
+    i = 0
+    while i < len(data):
+        eq = data.find(b"=", i)
+        if eq < 0:
+            raise Refused("option without a value")
+        key = data[i:eq]
+        if not KEY.match(key):
+            raise Refused("bad option name")
+        i = eq + 1
+        if data[i:i + 1] in (b'"', b"["):
+            raise Refused("unsupported quoting")
+        quoted = LENGTH_QUOTE.match(data, i)
+        if quoted:
+            start = quoted.end()
+            end = start + int(quoted.group(1))
+            if end > len(data):
+                raise Refused("quoted value runs past the end")
+        elif data[i:i + 1] == b"%":
+            raise Refused("unsupported quoting")
+        else:
+            start = i
+            end = data.find(b",", i)
+            end = len(data) if end < 0 else end
+        pairs.append((key.decode(), data[start:end].decode()))
+        i = end
+        if i < len(data):
+            if data[i:i + 1] != b",":
+                raise Refused("junk after a quoted value")
+            i += 1
+    return pairs
+
+
+def check_lavf(value):
+    for key, val in parse_kv(value):
+        if key not in LAVF_KEYS or not val.isdigit():
+            raise Refused("lavf option " + key)
+
+
+def check_loadfile_options(text):
+    for key, val in parse_kv(text):
+        if key not in LOADFILE_OPTIONS:
+            raise Refused("loadfile option " + key)
+        if key == "sub-files":
+            for entry in re.split(r"(?<!\\):", val):
+                check_url(entry.replace("\\:", ":"))
+        elif key == "demuxer-lavf-o-append":
+            check_lavf(val)
+
+
+def whole(value, low, high):
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def check_overlay_add(cmd):
+    """overlay-add id x y file offset fmt w h stride dw dh video_colorspace max_luma,
+    with file "overlay", which becomes the path to mpv's descriptor for the overlay file."""
+    if overlay_fd is None:
+        raise Refused("no overlay file")
+    if len(cmd) != 14:
+        raise Refused("overlay-add arguments")
+    _, oid, x, y, file, offset, fmt, w, h, stride, dw, dh, colorspace, luma = cmd
+    if file != "overlay" or fmt != "bgra" or colorspace != "no":
+        raise Refused("overlay-add source")
+    if not (whole(oid, 0, OVERLAY_IDS - 1) and whole(x, 0, OVERLAY_W - 1) and whole(y, 0, OVERLAY_H - 1)
+            and whole(w, 1, OVERLAY_W) and whole(h, 1, OVERLAY_H) and stride == 4 * w
+            and whole(dw, 1, OVERLAY_W) and whole(dh, 1, OVERLAY_H)
+            and whole(offset, 0, OVERLAY_SIZE) and offset + stride * h <= OVERLAY_SIZE):
+        raise Refused("overlay-add geometry")
+    if isinstance(luma, bool) or not isinstance(luma, (int, float)) or not 1 <= luma <= 1000:
+        raise Refused("overlay-add max_luma")
+    # mpv's own "@fd" form fails on Linux: mp_dup_cloexec calls fcntl with
+    # F_DUPFD_CLOEXEC and no third argument. The /proc path opens the same file.
+    cmd[4] = f"/proc/self/fd/{overlay_fd}"
+
+
+def check_command(cmd):
+    name = cmd[0]
+    if name in PLAIN:
+        return
+    if name == "overlay-add":
+        check_overlay_add(cmd)
+        return
+    if name == "overlay-remove":
+        if len(cmd) != 2 or not whole(cmd[1], 0, OVERLAY_IDS - 1):
+            raise Refused("overlay-remove arguments")
+        return
+    if name in SETTERS:
+        if len(cmd) < 2 or cmd[1] not in SETTABLE:
+            raise Refused("property " + str(cmd[1] if len(cmd) > 1 else ""))
+        if cmd[1] in LAVF:
+            if name not in ("set", "set_property", "set_property_string") or len(cmd) != 3:
+                raise Refused("lavf options only take set")
+            check_lavf(str(cmd[2]))
+        return
+    if name == "loadfile":
+        if not 2 <= len(cmd) <= 5:
+            raise Refused("loadfile arguments")
+        check_url(cmd[1])
+        if len(cmd) > 2 and cmd[2] not in LOADFILE_FLAGS:
+            raise Refused("loadfile flag")
+        if len(cmd) > 4:
+            check_loadfile_options(str(cmd[4]))
+        return
+    if name == "sub-add":
+        if not 2 <= len(cmd) <= 5:
+            raise Refused("sub-add arguments")
+        check_url(cmd[1])
+        return
+    raise Refused("command " + str(name))
+
+
+def check(line):
+    """Returns the request to send to mpv, re-encoded so mpv parses what was checked."""
+    try:
+        req = json.loads(line)
+    except ValueError:
+        raise Refused("not JSON") from None
+    if not isinstance(req, dict) or set(req) - {"command", "request_id", "async"}:
+        raise Refused("unexpected request fields")
+    rid = req.get("request_id")
+    if rid is not None and (isinstance(rid, bool) or not isinstance(rid, int)):
+        raise Refused("request_id")
+    cmd = req.get("command")
+    if not isinstance(cmd, list) or not cmd or not isinstance(cmd[0], str):
+        raise Refused("command list")
+    for arg in cmd:
+        if not isinstance(arg, (str, int, float, bool)):
+            raise Refused("argument type")
+        if isinstance(arg, str) and any(ord(c) < 0x20 for c in arg):
+            raise Refused("control character")
+    check_command(cmd)
+    return req
+
+
+def edid_standard():
+    """Reads the connected HDMI sink's Dolby vendor video block (OUI 00-D0-46)."""
+    drm = "/sys/class/drm"
+    for name in sorted(os.listdir(drm)):
+        if "-HDMI-A-" not in name:
+            continue
+        try:
+            with open(f"{drm}/{name}/status") as f:
+                if f.read().strip() != "connected":
+                    continue
+            with open(f"{drm}/{name}/edid", "rb") as f:
+                edid = f.read()
+        except OSError:
+            continue
+        for b in (edid[n:n + 128] for n in range(128, len(edid) - 127, 128)):
+            if b[0] != 0x02:
+                continue
+            i = 4
+            while i < min(b[2], 127):
+                tag, size = b[i] >> 5, b[i] & 31
+                d = b[i + 1:i + 1 + size]
+                if tag == 7 and size >= 5 and d[0] == 1 and d[1:4] == b"\x46\xd0\x00":
+                    x = d[4:]
+                    version = x[0] >> 5
+                    # Versions 0 and 1 predate the low-latency-only interface.
+                    if version < 2:
+                        return True, f"{name}: Dolby block version {version}"
+                    if len(x) < 3:
+                        return False, f"{name}: short Dolby block"
+                    interface = x[2] & 3
+                    return interface >= 2, f"{name}: interface {DOLBY_INTERFACES[interface]}"
+                i += 1 + size
+        return False, f"{name}: no Dolby Vision block in the EDID"
+    return False, "no connected HDMI sink"
+
+
+def probe():
+    kernel = subprocess.run([DVFRAME, "probe"], capture_output=True, text=True)
+    if kernel.returncode != 0:
+        print(json.dumps({"ok": False, "reason": (kernel.stdout + kernel.stderr).strip()}))
+        return 1
+    ok, reason = edid_standard()
+    print(json.dumps({"ok": ok, "reason": reason}))
+    return 0 if ok else 1
+
+
+def write_line(obj):
+    sys.stdout.buffer.write(json.dumps(obj, separators=(",", ":")).encode() + b"\n")
+    sys.stdout.buffer.flush()
+
+
+def relay(sock):
+    """Passes checked requests to mpv and every whole line from mpv back, until either side closes."""
+    sel = selectors.DefaultSelector()
+    sel.register(sys.stdin.buffer.raw, selectors.EVENT_READ, "plezy")
+    sel.register(sock, selectors.EVENT_READ, "mpv")
+    pending = {"plezy": b"", "mpv": b""}
+    while True:
+        for key, _ in sel.select():
+            data = os.read(0, 65536) if key.data == "plezy" else sock.recv(65536)
+            if not data:
+                return
+            buf = pending[key.data] + data
+            *lines, pending[key.data] = buf.split(b"\n")
+            if len(pending[key.data]) > MAX_LINE:
+                return
+            for line in lines:
+                if key.data == "mpv":
+                    sys.stdout.buffer.write(line + b"\n")
+                    continue
+                if not line.strip():
+                    continue
+                try:
+                    req = check(line)
+                except Refused as e:
+                    rid = None
+                    try:
+                        rid = json.loads(line).get("request_id")
+                    except (ValueError, AttributeError):
+                        pass
+                    write_line({"request_id": rid, "error": "refused by dv-tunnel: " + str(e)})
+                    continue
+                sock.sendall(json.dumps(req, separators=(",", ":")).encode() + b"\n")
+            sys.stdout.buffer.flush()
+
+
+def active_vt():
+    try:
+        with open("/sys/class/tty/tty0/active") as f:
+            vt = f.read().strip()
+        if vt.startswith("tty") and vt[3:].isdigit():
+            return vt[3:]
+    except OSError:
+        pass
+    return "1"
+
+
+def hdmi_audio():
+    """Finds the HDMI output whose jack reports a sink, as (card id, hdmi index, pcm)."""
+    for card in sorted(os.listdir("/proc/asound")):
+        if not re.fullmatch(r"card\d+", card):
+            continue
+        out = subprocess.run(["amixer", "-c", card[4:], "contents"],
+                             capture_output=True, text=True).stdout
+        jacks = re.findall(r"name='HDMI/DP,pcm=(\d+) Jack'\n.*\n\s*: values=(on|off)", out)
+        pcms = sorted(int(pcm) for pcm, _ in jacks)
+        for pcm, state in jacks:
+            if state == "on":
+                with open(f"/proc/asound/{card}/id") as f:
+                    return f.read().strip(), pcms.index(int(pcm)), f"/proc/asound/{card}/pcm{pcm}p/sub0/status"
+    return None
+
+
+def audio_args():
+    """Points mpv at the TV's HDMI device through ALSA.
+
+    logind takes deck's access to the sound devices away when tty2 becomes
+    active, and WirePlumber then closes its ALSA devices, so PipeWire only
+    offers its dummy output. Root can still open the device once PipeWire
+    lets go of it.
+    """
+    found = hdmi_audio()
+    if found is None:
+        return []
+    card, index, status = found
+    for _ in range(50):
+        with open(status) as f:
+            if f.read().strip() == "closed":
+                break
+        time.sleep(0.1)
+    return ["--ao=alsa", f"--audio-device=alsa/hdmi:CARD={card},DEV={index}", "--audio-fallback-to-null=yes"]
+
+
+def make_overlay():
+    """Creates the overlay file for the user sudo ran as and returns a read-only descriptor for mpv."""
+    uid, gid = os.environ.get("SUDO_UID", ""), os.environ.get("SUDO_GID", "")
+    if not uid.isdigit() or not gid.isdigit():
+        return None
+    try:
+        os.mkdir(OVERLAY_DIR, 0o755)
+    except FileExistsError:
+        pass
+    st = os.lstat(OVERLAY_DIR)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0:
+        return None
+    os.chmod(OVERLAY_DIR, 0o755)
+    try:
+        os.unlink(OVERLAY)
+    except FileNotFoundError:
+        pass
+    fd = os.open(OVERLAY, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        os.ftruncate(fd, OVERLAY_SIZE)
+        os.fchown(fd, int(uid), int(gid))
+        return os.open(OVERLAY, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    finally:
+        os.close(fd)
+
+
+def play(hz):
+    global overlay_fd
+    os.umask(0o077)
+    back = active_vt()
+    parent, child = socket.socketpair()
+    mpv = None
+    try:
+        overlay_fd = make_overlay()
+        subprocess.run(["chvt", "2"], check=True)
+        time.sleep(1)
+        env = {
+            "PATH": "/usr/bin",
+            "HOME": ROOT,
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "LD_LIBRARY_PATH": ROOT + "/lib",
+        }
+        args = [MPV, *MPV_ARGS, *audio_args(), f"--drm-mode=3840x2160@{hz}",
+                f"--input-ipc-client=fd://{child.fileno()}"]
+        fds = (child.fileno(),) if overlay_fd is None else (child.fileno(), overlay_fd)
+        mpv = subprocess.Popen(args, env=env, pass_fds=fds,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        child.close()
+        relay(parent)
+    except BrokenPipeError:
+        pass
+    finally:
+        # mpv quits when its IPC connection closes.
+        parent.close()
+        if mpv is not None:
+            try:
+                mpv.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                mpv.kill()
+                mpv.wait()
+        try:
+            os.unlink(OVERLAY)
+        except FileNotFoundError:
+            pass
+        subprocess.run([DVFRAME, "reset"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["chvt", back])
+    return 0
+
+
+def main():
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, lambda *_: sys.exit(1))
+    if sys.argv[1:] == ["probe"]:
+        return probe()
+    if len(sys.argv) == 3 and sys.argv[1] == "play" and sys.argv[2] in RATES:
+        return play(sys.argv[2])
+    sys.stderr.write("usage: dv-tunnel probe | dv-tunnel play {" + ",".join(sorted(RATES)) + "}\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

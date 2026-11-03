@@ -255,6 +255,21 @@ static int commit(drmModeAtomicReq *req, const char *what)
 	return 0;
 }
 
+/* Exits 0 when a connected HDMI connector offers the tunnel property, so a player can choose it. */
+static int probe(void)
+{
+	struct pipe p;
+
+	if (find_pipe(&p, 0) && !p.conn)
+		return 1;
+	if (find_prop(p.conn, DRM_MODE_OBJECT_CONNECTOR, "DVBRIDGE_DV_STANDARD_LAB", NULL, NULL, NULL)) {
+		printf("no DVBRIDGE_DV_STANDARD_LAB on connector %u\n", p.conn);
+		return 1;
+	}
+	printf("DVBRIDGE_DV_STANDARD_LAB on connector %u\n", p.conn);
+	return 0;
+}
+
 /* Clears the tunnel on the connector. Tries the connector alone first, then turns the pipe off. */
 static int reset(void)
 {
@@ -536,7 +551,9 @@ int main(int argc, char **argv)
 		perror("open /dev/dri/card0");
 		return 1;
 	}
-	drmSetMaster(fd);
+	/* probe only reads properties, which needs no master, and gamescope may hold it. */
+	if (strcmp(cmd, "probe"))
+		drmSetMaster(fd);
 	if (drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1) ||
 	    drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1)) {
 		perror("atomic client caps");
@@ -547,10 +564,12 @@ int main(int argc, char **argv)
 	signal(SIGHUP, on_signal);
 	if (!strcmp(cmd, "reset"))
 		ret = reset();
+	else if (!strcmp(cmd, "probe"))
+		ret = probe();
 	else if (!strcmp(cmd, "show"))
 		ret = show(argc > 2 ? atoi(argv[2]) : 20, argc > 3 ? atoi(argv[3]) : 24);
 	else {
-		fprintf(stderr, "usage: dvframe show [seconds] [hz] | dvframe reset\n");
+		fprintf(stderr, "usage: dvframe show [seconds] [hz] | dvframe reset | dvframe probe\n");
 		ret = 1;
 	}
 	close(fd);

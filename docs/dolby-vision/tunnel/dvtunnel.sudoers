@@ -1,0 +1,5 @@
+# Lets Plezy check for the Dolby Vision tunnel and start it. dv-tunnel checks
+# its own arguments and filters what reaches mpv. Installed as
+# /etc/sudoers.d/zz-dvtunnel by install-dvtunnel.sh. sudo reads that folder in
+# name order and the last match wins, so the name has to sort after "wheel".
+deck ALL=(root) NOPASSWD: /var/lib/dvtunnel/dv-tunnel probe, /var/lib/dvtunnel/dv-tunnel play *
