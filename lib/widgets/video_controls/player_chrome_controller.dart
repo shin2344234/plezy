@@ -5,7 +5,7 @@ import 'package:flutter/material.dart'
     show BuildContext, ListenableBuilder, MouseRegion, StatelessWidget, SystemMouseCursors, Widget;
 
 /// Reasons that keep the video-player chrome visible and suppress auto-hide.
-enum PlayerChromeHold { pip, contentStrip, promptInteraction, scrub, pointerPress }
+enum PlayerChromeHold { pip, contentStrip, promptInteraction, scrub, pointerPress, sheet }
 
 /// Owns video-player chrome visibility and auto-hide policy for one player route.
 class PlayerChromeController extends ChangeNotifier implements ValueListenable<bool> {
@@ -200,7 +200,9 @@ class PlayerChromeController extends ChangeNotifier implements ValueListenable<b
   /// out keeps the chrome until it lifts, so a slider or scrub in progress is
   /// not unmounted under the pointer.
   void hideForPointerExit() {
-    if (_holds.contains(PlayerChromeHold.pip)) return;
+    // A sheet opening over the player covers the chrome, which reads as the
+    // pointer leaving it even when nobody touched the mouse.
+    if (_holds.contains(PlayerChromeHold.pip) || _holds.contains(PlayerChromeHold.sheet)) return;
     if (_holds.contains(PlayerChromeHold.pointerPress)) {
       _pointerLeftWhilePressed = true;
       return;

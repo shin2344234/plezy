@@ -17,7 +17,57 @@ class _OverlaySheetEntry {
   final Completer<dynamic> completer;
   final FocusNode? initialFocusNode;
 
+  /// Back handlers of the sub-pages showing in this page, oldest first. See
+  /// [OverlaySheetPageBack].
+  final List<_OverlaySheetPageBackState> pageBacks = [];
+
   _OverlaySheetEntry({required this.builder, required this.completer, this.initialFocusNode});
+}
+
+/// Tells the descendants of one sheet page which entry they belong to.
+class _OverlaySheetPageScope extends InheritedWidget {
+  final _OverlaySheetEntry entry;
+
+  const _OverlaySheetPageScope({required this.entry, required super.child});
+
+  @override
+  bool updateShouldNotify(_OverlaySheetPageScope oldWidget) => !identical(entry, oldWidget.entry);
+}
+
+/// Gives the sheet page around it a back step of its own, such as a settings
+/// sub-view returning to its menu. The sheet runs [onBack] for Back before it
+/// pops a page or closes, wherever focus is in the sheet. Focus rests on the
+/// sheet's scope itself in pointer mode, above any key handler [child] has.
+class OverlaySheetPageBack extends StatefulWidget {
+  final VoidCallback? onBack;
+  final Widget child;
+
+  const OverlaySheetPageBack({super.key, required this.onBack, required this.child});
+
+  @override
+  State<OverlaySheetPageBack> createState() => _OverlaySheetPageBackState();
+}
+
+class _OverlaySheetPageBackState extends State<OverlaySheetPageBack> {
+  _OverlaySheetEntry? _entry;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final entry = context.dependOnInheritedWidgetOfExactType<_OverlaySheetPageScope>()?.entry;
+    if (identical(entry, _entry)) return;
+    _entry?.pageBacks.remove(this);
+    _entry = entry?..pageBacks.add(this);
+  }
+
+  @override
+  void dispose() {
+    _entry?.pageBacks.remove(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }
 
 /// Provides [OverlaySheetController] to descendants via [of] / [maybeOf].
@@ -526,7 +576,13 @@ class _OverlaySheetHostState extends State<OverlaySheetHost> with SingleTickerPr
   }
 
   void _handleBack() {
-    if (_pageStack.length > 1) {
+    final pageBack = _pageStack.lastOrNull?.pageBacks.reversed
+        .map((state) => state.widget.onBack)
+        .nonNulls
+        .firstOrNull;
+    if (pageBack != null) {
+      pageBack();
+    } else if (_pageStack.length > 1) {
       _pop();
     } else {
       _close();
@@ -680,7 +736,10 @@ class _OverlaySheetHostState extends State<OverlaySheetHost> with SingleTickerPr
                 enabled: identical(entry, top),
                 child: ExcludeFocus(
                   excluding: !identical(entry, top),
-                  child: Builder(builder: entry.builder),
+                  child: _OverlaySheetPageScope(
+                    entry: entry,
+                    child: Builder(builder: entry.builder),
+                  ),
                 ),
               ),
             ),

@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_symbols_icons/symbols.dart';
+import 'package:plezy/focus/input_mode_tracker.dart';
 import 'package:plezy/i18n/strings.g.dart';
 import 'package:plezy/media/ids.dart';
 import 'package:plezy/media/media_backend.dart';
@@ -22,6 +24,7 @@ import 'package:plezy/services/base_shared_preferences_service.dart';
 import 'package:plezy/services/multi_server_manager.dart';
 import 'package:plezy/services/settings_service.dart';
 import 'package:plezy/services/sleep_timer_service.dart';
+import 'package:plezy/utils/key_event_simulator.dart';
 import 'package:plezy/widgets/overlay_sheet.dart';
 import 'package:plezy/widgets/video_controls/models/track_controls_state.dart';
 import 'package:plezy/widgets/video_controls/sheets/video_settings_sheet.dart';
@@ -113,6 +116,36 @@ void main() {
     expect(appliedRates, [8.0]);
     expect(SettingsService.instance.read(SettingsService.defaultPlaybackSpeed), 8.0);
   });
+
+  for (final pad in [false, true]) {
+    testWidgets('Back in a sub-view returns to the menu, then closes the sheet (pad=$pad)', (tester) async {
+      final keys = KeyEventSimulatorController(deviceType: ui.KeyEventDeviceType.gamepad);
+      addTearDown(keys.dispose);
+      await _pumpSheetViaOverlayRoute(tester, _FakeSettingsPlayer(), trackInputMode: true);
+      if (pad) {
+        // The pad's A in keyboard mode, landing on the first row.
+        InputModeTracker.reportNonPointerInput();
+        await tester.pumpAndSettle();
+        Focus.of(tester.element(find.text('Playback Speed'))).requestFocus();
+        await tester.pump();
+        keys.simulateKeyDown(LogicalKeyboardKey.enter);
+        await tester.pump();
+        keys.simulateKeyUp(LogicalKeyboardKey.enter);
+      } else {
+        await tester.tap(find.text('Playback Speed'));
+      }
+      await tester.pumpAndSettle();
+      expect(find.text('Audio Channels'), findsNothing, reason: 'the speed list replaced the menu');
+
+      keys.simulateKeyPress(LogicalKeyboardKey.gameButtonB);
+      await tester.pumpAndSettle();
+      expect(find.text('Audio Channels'), findsOneWidget, reason: 'Back returned to the menu');
+
+      keys.simulateKeyPress(LogicalKeyboardKey.gameButtonB);
+      await tester.pumpAndSettle();
+      expect(find.text('Audio Channels'), findsNothing);
+    });
+  }
 
   testWidgets('applies a picked audio channel limit to the player and stores it', (tester) async {
     await SettingsService.instance.write(SettingsService.downmixCenterBoost, 4);
@@ -656,9 +689,8 @@ Future<void> _pumpSheet(
   await tester.pumpAndSettle();
 }
 
-Future<void> _pumpSheetViaOverlayRoute(WidgetTester tester, Player player) async {
-  await tester.pumpWidget(
-    MaterialApp(
+Future<void> _pumpSheetViaOverlayRoute(WidgetTester tester, Player player, {bool trackInputMode = false}) async {
+  final app = MaterialApp(
       theme: ThemeData(extensions: const [testMonoTokensAnimated]),
       home: OverlaySheetHost(
         child: Scaffold(
@@ -677,8 +709,8 @@ Future<void> _pumpSheetViaOverlayRoute(WidgetTester tester, Player player) async
           ),
         ),
       ),
-    ),
   );
+  await tester.pumpWidget(trackInputMode ? InputModeTracker(child: app) : app);
   await tester.tap(find.text('Open settings'));
   await tester.pumpAndSettle();
 }

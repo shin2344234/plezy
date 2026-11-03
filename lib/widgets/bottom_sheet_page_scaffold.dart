@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../focus/dpad_navigator.dart';
 import '../focus/key_event_utils.dart';
 import 'bottom_sheet_header.dart';
+import 'overlay_sheet.dart';
 
 /// Shared page layout for bottom sheets with a stable header and content area.
 ///
@@ -90,6 +91,8 @@ class BottomSheetPageScaffold extends StatelessWidget {
       );
     }
 
-    return content;
+    // Focus may sit above the handler, on the sheet's scope, so the sheet asks
+    // the page as well.
+    return OverlaySheetPageBack(onBack: back, child: content);
   }
 }

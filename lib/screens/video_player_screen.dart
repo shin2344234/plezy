@@ -3098,6 +3098,11 @@ class VideoPlayerScreenState extends State<VideoPlayerScreen>
         // with no sheet, exit the player. canPop:false keeps swipe-back disabled
         // so it doesn't fight timeline scrubbing.
         canPop: false,
+        // The chrome stays up under a sheet, so closing the sheet with Back
+        // returns to the controls rather than to bare video.
+        onOpenChanged: (open) => open
+            ? _chromeController.hold(PlayerChromeHold.sheet)
+            : _chromeController.release(PlayerChromeHold.sheet),
         onSystemBack: () {
           if (BackKeyCoordinator.consumeIfHandled()) return;
           BackKeyCoordinator.markHandled();
