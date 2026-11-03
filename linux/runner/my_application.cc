@@ -43,6 +43,55 @@ static void enable_video_plane_transparency(GtkWindow* window, FlView* view) {
 #endif
 }
 
+// Under gamescope the pointer starts in the top-left corner, over the side
+// navigation, which then stays open until the mouse moves. Gamescope puts it
+// back there around the app's focus change, so one move at map time doesn't
+// last. For the first few seconds, park it in the top-right corner whenever it
+// is found at the origin, and stop once it is anywhere else, since that means
+// the user moved it. Desktop sessions keep the pointer where the user put it.
+static constexpr guint kParkPointerIntervalMs = 250;
+static constexpr int kParkPointerTicks = 32;
+
+struct PointerPark {
+  GtkWidget* window;
+  int ticks_left;
+};
+
+static gboolean park_pointer_tick(gpointer user_data) {
+  auto* park = static_cast<PointerPark*>(user_data);
+  GdkWindow* gdk_window = gtk_widget_get_window(park->window);
+  GdkDisplay* display = gtk_widget_get_display(park->window);
+  GdkSeat* seat = gdk_display_get_default_seat(display);
+  GdkDevice* pointer = seat == nullptr ? nullptr : gdk_seat_get_pointer(seat);
+  GdkMonitor* monitor = gdk_window == nullptr ? nullptr : gdk_display_get_monitor_at_window(display, gdk_window);
+  if (pointer == nullptr || monitor == nullptr) return --park->ticks_left > 0;
+  GdkRectangle area;
+  gdk_monitor_get_geometry(monitor, &area);
+  const int parked_x = area.x + area.width - 1;
+  const int parked_y = area.y;
+  gint x = 0;
+  gint y = 0;
+  gdk_device_get_position(pointer, nullptr, &x, &y);
+  if (x == area.x && y == area.y) {
+    gdk_device_warp(pointer, gtk_widget_get_screen(park->window), parked_x, parked_y);
+  } else if (x != parked_x || y != parked_y) {
+    return G_SOURCE_REMOVE;
+  }
+  return --park->ticks_left > 0;
+}
+
+static gboolean park_pointer_on_map(GtkWidget* widget, GdkEvent* event, gpointer user_data) {
+  (void)event;
+  (void)user_data;
+  g_signal_handlers_disconnect_by_func(widget, reinterpret_cast<gpointer>(park_pointer_on_map), nullptr);
+  auto* park = g_new0(PointerPark, 1);
+  park->window = widget;
+  park->ticks_left = kParkPointerTicks;
+  park_pointer_tick(park);
+  g_timeout_add_full(G_PRIORITY_DEFAULT, kParkPointerIntervalMs, park_pointer_tick, park, g_free);
+  return FALSE;
+}
+
 struct _MyApplication {
   GtkApplication parent_instance;
   char** dart_entrypoint_arguments;
@@ -97,6 +146,9 @@ static void my_application_activate(GApplication* application) {
       fl_plugin_registry_get_registrar_for_plugin(FL_PLUGIN_REGISTRY(self->flutter_view), "MpvAudioPlugin");
   mpv_audio_plugin_register_with_registrar(audio_registrar);
 
+  if (g_getenv("GAMESCOPE_WAYLAND_DISPLAY") != nullptr) {
+    g_signal_connect(window, "map-event", G_CALLBACK(park_pointer_on_map), nullptr);
+  }
   gtk_widget_show(GTK_WIDGET(window));
   gtk_widget_grab_focus(GTK_WIDGET(self->flutter_view));
 }
