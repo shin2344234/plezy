@@ -120,6 +120,7 @@ import 'video_player/live_tv_session_state.dart';
 import 'video_player/tv_background_suspend_policy.dart';
 import 'video_player/tv_background_suspend_state.dart';
 import 'video_player/visual_effects_controller.dart';
+import 'video_player/widgets/dv_tunnel_capture.dart';
 import 'video_player/widgets/player_prompt_overlays.dart';
 import '../widgets/overlay_sheet.dart';
 import '../widgets/video_controls/player_chrome_controller.dart';
@@ -3093,35 +3094,37 @@ class VideoPlayerScreenState extends State<VideoPlayerScreen>
         // DirectionalFocusAction / ActivateAction can process them.
         return KeyEventResult.ignored;
       },
-      child: OverlaySheetHost(
-        // Host owns sheet + system back: a back with a sheet open closes it;
-        // with no sheet, exit the player. canPop:false keeps swipe-back disabled
-        // so it doesn't fight timeline scrubbing.
-        canPop: false,
-        // The chrome stays up under a sheet, so closing the sheet with Back
-        // returns to the controls rather than to bare video.
-        onOpenChanged: (open) => open
-            ? _chromeController.hold(PlayerChromeHold.sheet)
-            : _chromeController.release(PlayerChromeHold.sheet),
-        onSystemBack: () {
-          if (BackKeyCoordinator.consumeIfHandled()) return;
-          BackKeyCoordinator.markHandled();
-          _handleScreenPlayerNavigation(PlayerNavigationKey.back);
-        },
-        child: Builder(
-          key: _overlayChildKey,
-          builder: (sheetContext) {
-            final playbackFailure = _playbackFailureMessage;
-            if (playbackFailure != null) {
-              return _buildPlaybackFailure(playbackFailure, onRetry: _playbackFailureRetry!);
-            }
-            if (_isPlayerInitialized && player != null) return _buildVideoPlayer(sheetContext);
-            final initializationError = _playerInitializationError;
-            if (initializationError != null) {
-              return _buildPlaybackFailure(initializationError, onRetry: _retryPlayerInitialization);
-            }
-            return _buildLoadingSpinner();
+      child: DvTunnelCapture(
+        child: OverlaySheetHost(
+          // Host owns sheet + system back: a back with a sheet open closes it;
+          // with no sheet, exit the player. canPop:false keeps swipe-back disabled
+          // so it doesn't fight timeline scrubbing.
+          canPop: false,
+          // The chrome stays up under a sheet, so closing the sheet with Back
+          // returns to the controls rather than to bare video.
+          onOpenChanged: (open) => open
+              ? _chromeController.hold(PlayerChromeHold.sheet)
+              : _chromeController.release(PlayerChromeHold.sheet),
+          onSystemBack: () {
+            if (BackKeyCoordinator.consumeIfHandled()) return;
+            BackKeyCoordinator.markHandled();
+            _handleScreenPlayerNavigation(PlayerNavigationKey.back);
           },
+          child: Builder(
+            key: _overlayChildKey,
+            builder: (sheetContext) {
+              final playbackFailure = _playbackFailureMessage;
+              if (playbackFailure != null) {
+                return _buildPlaybackFailure(playbackFailure, onRetry: _playbackFailureRetry!);
+              }
+              if (_isPlayerInitialized && player != null) return _buildVideoPlayer(sheetContext);
+              final initializationError = _playerInitializationError;
+              if (initializationError != null) {
+                return _buildPlaybackFailure(initializationError, onRetry: _retryPlayerInitialization);
+              }
+              return _buildLoadingSpinner();
+            },
+          ),
         ),
       ),
     );

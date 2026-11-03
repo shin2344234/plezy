@@ -847,6 +847,7 @@ extension _VideoPlayerOpenMethods on VideoPlayerScreenState {
     required bool isTranscoding,
     required bool isLocalMedia,
     required MediaVersion? selectedVersion,
+    required MediaDisplayCriteria? displayCriteria,
     required _PlaybackOpenTiming timing,
     required PlaybackOpenOutcome outcome,
     Map<String, String>? headers,
@@ -876,6 +877,16 @@ extension _VideoPlayerOpenMethods on VideoPlayerScreenState {
       _lastLogError = null;
       _transportFaultSeen = false;
       onOpening?.call();
+      // On SteamOS a Dolby Vision file can play through the TV's own Dolby
+      // Vision processing. Only a direct play over the network keeps the
+      // Dolby Vision layer and can be opened by the tunnel's helper.
+      if (player is PlayerLinux) {
+        player.prepareOpen(
+          dolbyVision:
+              !isTranscoding && !isLocalMedia && !widget.isLive && (displayCriteria?.doviProfile ?? 0) > 0,
+          fps: displayCriteria?.fps,
+        );
+      }
       return player.open(
         media,
         // The last word on the vehicle, taken here because this is the only place media actually
@@ -1097,6 +1108,7 @@ extension _VideoPlayerOpenMethods on VideoPlayerScreenState {
         isTranscoding: result.isTranscoding,
         isLocalMedia: isLocalMedia,
         selectedVersion: result.selectedVersion,
+        displayCriteria: displayCriteria,
         timing: openTiming,
         outcome: outcome,
         headers: headers,
