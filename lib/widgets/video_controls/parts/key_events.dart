@@ -72,6 +72,9 @@ extension _PlexVideoControlsKeyEventMethods on _PlexVideoControlsState {
     // controls" affordance, and the visible chrome suppresses the transient
     // transport disc that would otherwise flash underneath it.
     _showControlsWithFocus(requestFocus: requestFocus);
+    // A pad's A only raises the controls. Start, or A on the play button,
+    // toggles playback.
+    if (event.deviceType == ui.KeyEventDeviceType.gamepad) return;
     unawaited(_playOrPause());
   }
 
@@ -301,7 +304,10 @@ extension _PlexVideoControlsKeyEventMethods on _PlexVideoControlsState {
     // The chrome deliberately stays down — the screen announces the accepted
     // command with a centred transient disc instead (#1676).
     if (transportCommand != null) {
-      if ((videoPlayerNavigationPreference() || isMobile) && event is KeyDownEvent) {
+      // A pad's Start comes through the key simulator, which the desktop
+      // global handler never sees.
+      final fromPad = event.deviceType == ui.KeyEventDeviceType.gamepad;
+      if ((videoPlayerNavigationPreference() || isMobile || fromPad) && event is KeyDownEvent) {
         unawaited(_playOrPause(command: transportCommand));
       }
       return KeyEventResult.handled;

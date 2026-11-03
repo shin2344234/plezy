@@ -1,5 +1,6 @@
 import 'dart:async' show StreamSubscription, Timer, unawaited;
 import 'dart:io' show Platform;
+import 'dart:ui' as ui show KeyEventDeviceType;
 
 import '../../media/ids.dart';
 

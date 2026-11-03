@@ -166,6 +166,7 @@ class GamepadService with WindowListener {
     LogicalKeyboardKey.gameButtonA: PhysicalKeyboardKey.gameButtonA,
     LogicalKeyboardKey.gameButtonB: PhysicalKeyboardKey.gameButtonB,
     LogicalKeyboardKey.gameButtonX: PhysicalKeyboardKey.gameButtonX,
+    LogicalKeyboardKey.mediaPlayPause: PhysicalKeyboardKey.mediaPlayPause,
   };
 
   static GamepadService? _instance;
@@ -481,6 +482,9 @@ class GamepadService with WindowListener {
           _dispatchTabNavigation(previous: true);
         case GamepadButton.rightShoulder:
           _dispatchTabNavigation(previous: false);
+        // Start is the pad's play/pause; A only selects.
+        case GamepadButton.start:
+          _simulator.simulateKeyPress(LogicalKeyboardKey.mediaPlayPause);
         default:
           break;
       }
