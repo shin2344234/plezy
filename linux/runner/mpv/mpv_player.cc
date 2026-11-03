@@ -412,6 +412,9 @@ bool MpvPlayer::Initialize() {
     mpv_set_option_string(mpv_, "hdr-compute-peak", "auto");
     mpv_set_option_string(mpv_, "target-colorspace-hint", plezy::mpv_common::TargetColorspaceHint(hdr_enabled_));
     mpv_set_option_string(mpv_, "osc", "yes");
+    // force-window keeps the window up while the core is idle, and the OSC
+    // would draw mpv's logo and "Drop files or URLs to play here." on it.
+    mpv_set_option_string(mpv_, "script-opts", "osc-idlescreen=no");
     mpv_set_option_string(mpv_, "input-default-bindings", "yes");
     mpv_set_option_string(mpv_, "input-vo-keyboard", "yes");
     mpv_set_option_string(mpv_, "input-gamepad", "yes");
